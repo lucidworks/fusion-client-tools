@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit;
  */
 public class FusionDocumentWriter {
 
-  private Log log = LogFactory.getLog(FusionDocumentWriter.class);
+  private final Log log = LogFactory.getLog(FusionDocumentWriter.class);
 
   public static MetricName metricName(Class<?> producerClass, String metric, String indexerName) {
     return new MetricName("hbaseindexer", producerClass.getSimpleName(), metric, indexerName);
@@ -110,16 +110,22 @@ public class FusionDocumentWriter {
     // shs: Only process the inputDocuments collection if there are still documents remaining in the collection after
     //      the atomic updates have been processed.
     if (inputDocuments != null && !inputDocuments.isEmpty()) {
-      List<Map<String, Object>> fusionDocs = null;
+      List<Map<String, Object>> fusionDocs = new ArrayList<Map<String, Object>>(inputDocuments.size());
+      log.info("Method:add - inputDocuments.size():[" + inputDocuments.size() + "], inputDocuments:[" + inputDocuments.toString() +
+              "], fusionDocs:[" + fusionDocs + "]. Call toJsonDocs(null, inputDocuments, 0");
       try {
         fusionDocs = toJsonDocs(null, inputDocuments, 0);
       } catch (Exception exc) {
         throw new RuntimeException(exc);
       }
-
+      log.info("Method:add - after return from toJsonDocs(null, inputDocuments, 0): fusionDocs.size():[" + fusionDocs.size() +
+               "], fusionDocs:[" + fusionDocs.toString() + "].");
       try {
+        log.info("Method:add - sending fusionDocs to indexing pipeline:[" + fusionDocs.size() +
+                "], fusionDocs:[" + fusionDocs.toString() + "].");
+
         pipelineClient.postBatchToPipeline(fusionDocs);
-        indexAddMeter.mark(inputDocuments.size());
+        indexAddMeter.mark(fusionDocs.size());
       } catch (Exception e) {
         retryAddsIndividually(fusionDocs);
       }
@@ -128,7 +134,7 @@ public class FusionDocumentWriter {
 
   /**
    * shs: New method added for handling Atomic Updates.
-   * @param inputDocuments
+   * @param inputDocuments This is the list of documents that are atomic update documents.
    * @return inputDocuments (modified: the atomic update documents have been removed from the incoming parameter and
    *         only non-atomic update documents remain in that collection). The null value will be returned if all
    *         documents from the list of SolrInputDocuments have been removed.
@@ -146,20 +152,41 @@ public class FusionDocumentWriter {
 
     // This for loop utilizes an iterator which makes it possible to remove items from the inputDocuments collection
     // without getting a concurrent update exception.
+    int docCount = 0;
+    boolean documentIsAtomic = false;
     for (Iterator<SolrInputDocument> docIterator = inputDocuments.iterator(); docIterator.hasNext();) {
       SolrInputDocument doc = docIterator.next();
+      int sifCount = 0;
       for (SolrInputField sif : doc.values()) {
         Object val = sif.getValue();
         // If the type of the field just retrieved from the document is a Map object, then this is an atomic update
         // document and it should be added to the atomicUpdateDocs and also removed from the inputDocuments.
         if (val instanceof Map) {
-          atomicUpdateDocuments.add(doc);
-          docIterator.remove();
-          // If we have one field that is a Map, then the document is an atomic update document and it is not
-          // necessary to check the remaining fields in the document.
+          int entryCount = 0;
+          for (Map.Entry<String, Object> entry : ((Map<String, Object>) val).entrySet()) {
+            String key = entry.getKey();
+            if (key.equals("add") || key.equals("set")|| key.equals("remove") || key.equals("removeregex") || key.equals("inc")) {
+              log.info("method:addAtomicUpdateDocuments - Found atomic update document [" + doc.toString() + "], docCount:[" + docCount + "], sifCount:[" + sifCount + "], entryCount:[" + entryCount + "]");
+              atomicUpdateDocuments.add(doc);
+              docIterator.remove();
+              documentIsAtomic = true;
+              break; // from the entry for loop
+            }
+            entryCount++;
+          }
+        }
+        // The document was determined to be an atomic update document, no need to visit the rest of the fields, so
+        // break from the sif loop.
+        if (documentIsAtomic) {
           break;
         }
+        sifCount++;
       }
+      if (!documentIsAtomic) {
+        log.info("method:addAtomicUpdateDocuments - Found normal document to index [" + doc.toString() + "], docCount:[" + docCount + "], sifCount:[" + sifCount + "]");
+      }
+      documentIsAtomic = false;
+      docCount++;
     }
 
     // The following processing is necessary IFF there are documents in the atomicUpdateDocuments collection, which
@@ -194,8 +221,12 @@ public class FusionDocumentWriter {
    * @throws Exception
    */
   protected List<Map<String,Object>> toJsonDocs(SolrInputDocument parentSolrDoc, Collection<SolrInputDocument> childSolrDocs, int docCount) throws Exception {
+    log.info("Method:toJsonDocs - Processing SolrInputDocuments: parent:["+ (parentSolrDoc==null ? "null" : parentSolrDoc.toString()) +
+             "] with " + childSolrDocs.size() + " child documents.");
     List<Map<String,Object>> list = new ArrayList<Map<String,Object>>(childSolrDocs.size());
     for (SolrInputDocument childSolrDoc : childSolrDocs) {
+      log.info("Method:toJsonDocs - Processing SolrInputDocuments: parent:["+ (parentSolrDoc==null ? "null" : parentSolrDoc.toString()) +
+               "]; child:[" + childSolrDoc.toString() + "]");
       list.addAll(toJson(parentSolrDoc, childSolrDoc, docCount));
     }
     return list;
@@ -214,17 +245,26 @@ public class FusionDocumentWriter {
    * @throws Exception
    */
   protected List<Map<String,Object>> toJson(SolrInputDocument parent, SolrInputDocument child, int docCount) throws Exception {
+    log.info("Method:toJson - Processing SolrInputDocuments: parent:["+ (parent==null ? "null" : parent.toString()) +
+             "]; child[" + (child==null ? "null" : child.toString()) + "]; docCount:[" + docCount + "].");
     List<Map<String,Object>> docs = new ArrayList<Map<String, Object>>();
-    List<SolrInputDocument> childDocs = child.getChildDocuments();
-    if (childDocs != null && !childDocs.isEmpty()) {
-      //for (SolrInputDocument child : childDocs) {
+    if (child != null) {
+      List<SolrInputDocument> childDocs = child.getChildDocuments();
+      if (childDocs != null && !childDocs.isEmpty()) {
+        log.info("Method:toJson - Processing SolrInputDocuments: parent:[" + (parent == null ? "null" : parent.toString()) +
+                "]; child is a nested document with " + childDocs.size() + " nested documents.\n" +
+                "Recursive call to 'toJsonDocs(child,childDocs,docCount)'.");
+        //for (SolrInputDocument child : childDocs) {
         // docs.add(doc2json(doc, child, docCount++));
         docs.addAll(toJsonDocs(child, childDocs, docCount++));
-      //}
-    } else {
-      // docs.add(doc2json(null, doc, docCount++));
-      // I'm not certain the increment should be on the docCount here...
-      docs.add(doc2json(parent, child, docCount++));
+        //}
+      } else {
+        // docs.add(doc2json(null, doc, docCount++));
+        log.info("Method:toJson - Processing SolrInputDocuments: parent:[" + (parent == null ? "null" : parent.toString()) +
+                "]; child:[" + child.toString() + "]. Calling doc2json.");
+        // I'm not certain the increment should be on the docCount here...
+        docs.add(doc2json(parent, child, docCount++));
+      }
     }
     return docs;
   }
@@ -242,41 +282,54 @@ public class FusionDocumentWriter {
    *                  Fusion.
    */
   protected Map<String,Object> doc2json(SolrInputDocument parent, SolrInputDocument child, int docCount) {
+    log.info("Method:doc2json - Processing SolrInputDocuments: parent:["+ (parent==null ? "null" : parent.toString()) +
+            "]; child[" + (child==null ? "null" : child.toString()) + "]; docCount:[" + docCount + "].");
     Map<String,Object> json = new HashMap<String,Object>();
-    String docId = (String) child.getFieldValue("id");
-    if (docId == null) {
-      if (parent != null) {
-        String parentId = (String)parent.getFieldValue("id");
-        docId = parentId+"-"+ docCount;
+    if (child != null) {
+      String docId = (String) child.getFieldValue("id");
+      if (docId == null) {
+        if (parent != null) {
+          String parentId = (String) parent.getFieldValue("id");
+          docId = parentId + "-" + docCount;
+        }
+        if (docId == null)
+          throw new IllegalStateException("Couldn't resolve the id for document: " + child);
       }
-      if (docId == null)
-        throw new IllegalStateException("Couldn't resolve the id for document: "+ child);
-    }
-    json.put("id", docId);
+      json.put("id", docId);
 
-    List fields = new ArrayList();
-    if (parent != null) {
-      // have a parent doc ... flatten by adding all parent doc fields to this doc with prefix _p_
-      for (String f : parent.getFieldNames()) {
-        if ("id".equals(f)) {
-          fields.add(mapField("_p_id_s", null /* field name prefix */, parent.getField("id").getFirstValue()));
-        } else {
-          appendField(child, f, "_p_", fields);
+      List fields = new ArrayList();
+      if (parent != null) {
+        log.info("Method:doc2json - Merging parent and child docs, parent:[" + parent.toString() +
+                "]; child[" + child.toString() + "].");
+
+        // have a parent doc ... flatten by adding all parent doc fields to the child with prefix _p_
+        for (String f : parent.getFieldNames()) {
+          if ("id".equals(f)) {
+            fields.add(mapField("_p_id_s", null /* field name prefix */, parent.getField("id").getFirstValue()));
+          } else {
+            appendField(child, f, "_p_", fields);
+          }
+        }
+        log.info("Method:doc2json - After merging parent and child docs, parent:[" + parent.toString() +
+                "]; child[" + child.toString() + "].");
+      }
+
+      for (String f : child.getFieldNames()) {
+        if (!"id".equals(f)) { // id already added
+          appendField(child, f, null, fields);
+          log.info("Method:doc2json - After appending fields parent:[" + (parent == null ? "null" : parent.toString()) +
+                  "]; child[" + child.toString() + "].");
         }
       }
+
+      // keep track of the time we saw this doc on the hbase side
+      fields.add(mapField("_hbasets_tdt", null, DateUtil.getThreadLocalDateFormat().format(new Date())));
+
+      json.put("fields", fields);
+      log.info("Method:doc2json - Merged JSON document being returned:[" + json + "].");
+    } else {
+      log.warn("method:doc2json - Input parameter 'child' was null.");
     }
-
-    for (String f : child.getFieldNames()) {
-      if (!"id".equals(f)) { // id already added
-        appendField(child, f, null, fields);
-      }
-    }
-
-    // keep track of the time we saw this doc on the hbase side
-    fields.add(mapField("_hbasets_tdt", null, DateUtil.getThreadLocalDateFormat().format(new Date())));
-
-    json.put("fields", fields);
-
     return json;
   }
 
@@ -324,7 +377,7 @@ public class FusionDocumentWriter {
    *      get documents into the index if the previous indexing attempt failed when sending the entire colleciton of
    *      documents to the Solr proxy. In this case, each document in the collection of documents will be submitted to
    *      the Solr proxy, one document at a time.
-   * @param docs
+   * @param docs The SolrInputDocuments to be added, one at a time.
    * @throws SolrServerException
    * @throws IOException
    */
@@ -368,7 +421,7 @@ public class FusionDocumentWriter {
         // shs: Changes here were made for Zendesk ticket 4186: Hbase row delete not deleting row in Fusion.
         //      The problem reported is that when deleting by a parent document ID, after the denormalization of the
         //      documents to be indexed, there are no documents with the parent document's ID (which is the HBase row
-        //      number). If the retryDeletesIndividually() failes, then a call will be made to deleteByQuery() with
+        //      number). If the retryDeletesIndividually() fails, then a call will be made to deleteByQuery() with
         //      the query string set to the value of idToDelete with the string "|||*" appended: <idToDelete>|||*. This
         //      should enable Solr to delete all documents that originated from the specified HBase row ID, but which have
         //      had their ID modified to include not only the original parent document's id, but have also had the
