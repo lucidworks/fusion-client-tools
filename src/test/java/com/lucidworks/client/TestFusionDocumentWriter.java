@@ -9,6 +9,8 @@ import org.codehaus.jackson.JsonNode;
 import org.junit.Rule;
 import org.junit.Test;
 import static org.junit.Assert.*;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 
 import java.io.IOException;
 import java.util.HashMap;
@@ -20,11 +22,15 @@ import static com.github.tomakehurst.wiremock.client.WireMock.*;
 
 public class TestFusionDocumentWriter {
 
+  private Log log = LogFactory.getLog(FusionDocumentWriter.class);
+
   @Rule
   public WireMockRule wireMockRule = new WireMockRule(8089); // No-args constructor defaults to port 8080
 
   @Test
   public void testFusionDocumentWriter() throws Exception {
+    // TODO Need to add nested documents to at least the "grandchild" level, meaning it needs to be more than just a
+    //      single nest level, i.e. parent with child.
 
     String fusionUrl = "http://localhost:8089/api/pipeline";
     String fusionSolrProxy = "http://localhost:8089/api/solr";
@@ -57,7 +63,36 @@ public class TestFusionDocumentWriter {
       }
     });
 
+    log.info("Adding one document from buildInputDocs().");
     docWriter.add(1, buildInputDocs(1));
+    log.info("Adding two documents from buildAtomicUpdateDocs().");
+    docWriter.add(1, buildAtomicUpdateDocs(2));
+    log.info("Done adding documents.");
+  }
+
+  protected Map<String, SolrInputDocument> buildAtomicUpdateDocs(int numDocs) {
+    Map<String, SolrInputDocument> inputDocumentMap = new HashMap<String,SolrInputDocument>();
+    Map<String,String> atomicUpdateMap = new HashMap<String, String>();
+    for (int d=0; d < numDocs; d++) {
+      SolrInputDocument doc = new SolrInputDocument();
+      String docId = "doc"+d;
+      doc.setField("id", docId);
+      // Atomic Updates now...
+      atomicUpdateMap.clear();
+      // An 'add' atomic update
+      atomicUpdateMap.put("add", "add"+d);
+      doc.setField("add_s", atomicUpdateMap);
+      // A set example
+      atomicUpdateMap.clear();
+      atomicUpdateMap.put("set", "This is a set value in document " + d + ".");
+      doc.setField("set_s", atomicUpdateMap);
+      // An increment example
+      atomicUpdateMap.clear();
+      atomicUpdateMap.put("inc", Integer.toString(d));
+      doc.setField("inc_ti", atomicUpdateMap);
+      inputDocumentMap.put(docId, doc);
+    }
+    return inputDocumentMap;
   }
 
   /**
@@ -78,6 +113,12 @@ public class TestFusionDocumentWriter {
       } catch (IOException e) {
         throw new RuntimeException(e);
       }
+      // TODO The validation of a solr input document needs to be improved...currently there is no checking only an
+      //      additional 'else' clause to detect documents being sent to Solr instead of the Fusion pipeline. Without
+      //      this, the validation failed because it was expecting JSON documents.
+    } else if (request.getUrl().endsWith("/solr")) {
+      String body = request.getBodyAsString();
+      log.info("Solr document(s) as string:[" + body + "]");
     }
   }
 
