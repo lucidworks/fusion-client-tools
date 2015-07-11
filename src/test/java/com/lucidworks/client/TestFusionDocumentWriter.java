@@ -4,6 +4,7 @@ import com.github.tomakehurst.wiremock.http.Request;
 import com.github.tomakehurst.wiremock.http.RequestListener;
 import com.github.tomakehurst.wiremock.http.Response;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
+import org.apache.hadoop.util.hash.Hash;
 import org.apache.solr.common.SolrInputDocument;
 import org.codehaus.jackson.JsonNode;
 import org.junit.Rule;
@@ -64,35 +65,19 @@ public class TestFusionDocumentWriter {
     });
 
     log.info("Adding one document from buildInputDocs().");
-    docWriter.add(1, buildInputDocs(1));
-    log.info("Adding two documents from buildAtomicUpdateDocs().");
-    docWriter.add(1, buildAtomicUpdateDocs(2));
-    log.info("Done adding documents.");
-  }
+    docWriter.add(1, buildInputDocs(1, 0));
+    log.info("\nAdding two documents from buildAtomicUpdateDocs().");
+    docWriter.add(1, buildAtomicUpdateDocs(2, 0));
 
-  protected Map<String, SolrInputDocument> buildAtomicUpdateDocs(int numDocs) {
-    Map<String, SolrInputDocument> inputDocumentMap = new HashMap<String,SolrInputDocument>();
-    Map<String,String> atomicUpdateMap = new HashMap<String, String>();
-    for (int d=0; d < numDocs; d++) {
-      SolrInputDocument doc = new SolrInputDocument();
-      String docId = "doc"+d;
-      doc.setField("id", docId);
-      // Atomic Updates now...
-      atomicUpdateMap.clear();
-      // An 'add' atomic update
-      atomicUpdateMap.put("add", "add"+d);
-      doc.setField("add_s", atomicUpdateMap);
-      // A set example
-      atomicUpdateMap.clear();
-      atomicUpdateMap.put("set", "This is a set value in document " + d + ".");
-      doc.setField("set_s", atomicUpdateMap);
-      // An increment example
-      atomicUpdateMap.clear();
-      atomicUpdateMap.put("inc", Integer.toString(d));
-      doc.setField("inc_ti", atomicUpdateMap);
-      inputDocumentMap.put(docId, doc);
-    }
-    return inputDocumentMap;
+    log.info("\n\nStarting homoginized list of documents...");
+    Map<String, SolrInputDocument> homoginizedDocuments = buildInputDocs(1,0);
+    homoginizedDocuments.putAll(buildAtomicUpdateDocs(2, 2));
+    homoginizedDocuments.putAll(buildInputDocs(1, 10));
+    homoginizedDocuments.putAll(buildAtomicUpdateDocs(1, 13));
+    homoginizedDocuments.putAll(buildInputDocs(2, 20));
+    log.info("\n\nAdding homoginized documents. homoginizedDocuments:[" + homoginizedDocuments.toString() + "]");
+    docWriter.add(1, homoginizedDocuments);
+    log.info("Done adding documents.");
   }
 
   /**
@@ -122,9 +107,9 @@ public class TestFusionDocumentWriter {
     }
   }
 
-  protected Map<String, SolrInputDocument> buildInputDocs(int numDocs) {
+  protected Map<String, SolrInputDocument> buildInputDocs(int numDocs, int startVal) {
     Map<String, SolrInputDocument> inputDocumentMap = new HashMap<String,SolrInputDocument>();
-    for (int d=0; d < numDocs; d++) {
+    for (int d=startVal; d < numDocs+startVal; d++) {
       SolrInputDocument doc = new SolrInputDocument();
       String docId = "doc"+d;
       doc.setField("id", docId);
@@ -133,4 +118,39 @@ public class TestFusionDocumentWriter {
     }
     return inputDocumentMap;
   }
+
+
+  /**
+   * shs: Generate atomic update documents for validating the atomic update portion of the add method.
+   * @param numDocs   The number of atomic update documents to be created.
+   * @param startVal  The initial starting value of incrementer. By having this parameter, we can create lists of
+   *                  documents where normal documents and atomic update documents are intermingled. This will permit
+   *                  the verification of the parser that seperates atomic update documents from regular documents.
+   * @return
+   */
+  protected Map<String, SolrInputDocument> buildAtomicUpdateDocs(int numDocs, int startVal) {
+    Map<String, SolrInputDocument> inputDocumentMap = new HashMap<String,SolrInputDocument>();
+    Map<String,String> atomicUpdateMap = new HashMap<String, String>();
+    for (int d=startVal; d < numDocs+startVal; d++) {
+      SolrInputDocument doc = new SolrInputDocument();
+      String docId = "doc"+d;
+      doc.setField("id", docId);
+      // Atomic Updates now...
+      atomicUpdateMap.clear();
+      // An 'add' atomic update
+      atomicUpdateMap.put("add", "add"+d);
+      doc.setField("add_s", atomicUpdateMap);
+      // A set example
+      atomicUpdateMap.clear();
+      atomicUpdateMap.put("set", "This is a set value in document " + d + ".");
+      doc.setField("set_s", atomicUpdateMap);
+      // An increment example
+      atomicUpdateMap.clear();
+      atomicUpdateMap.put("inc", Integer.toString(d));
+      doc.setField("inc_ti", atomicUpdateMap);
+      inputDocumentMap.put(docId, doc);
+    }
+    return inputDocumentMap;
+  }
+
 }
