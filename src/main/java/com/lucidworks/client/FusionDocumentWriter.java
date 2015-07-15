@@ -39,8 +39,10 @@ public class FusionDocumentWriter {
   protected FusionPipelineClient pipelineClient;
   private String solrProxies;
   protected SolrServer solrProxy;
+  private final String deleteByQueryAppendString = "|||*";
 
   public FusionDocumentWriter(String indexName, Map<String, String> connectionParams) {
+
 
     String fusionEndpoint = connectionParams.get("fusion.pipeline");
     if (fusionEndpoint == null)
@@ -156,17 +158,25 @@ public class FusionDocumentWriter {
     boolean documentIsAtomic = false;
     for (Iterator<SolrInputDocument> docIterator = inputDocuments.iterator(); docIterator.hasNext();) {
       SolrInputDocument doc = docIterator.next();
-      int sifCount = 0;
-      for (SolrInputField sif : doc.values()) {
-        Object val = sif.getValue();
-        // If the type of the field just retrieved from the document is a Map object, then this is an atomic update
-        // document and it should be added to the atomicUpdateDocs and also removed from the inputDocuments.
+      int solrInputFieldCount = 0;
+      for (SolrInputField solrInputField : doc.values()) {
+        Object val = solrInputField.getValue();
+        // If the type of the field just retrieved from the document is a Map object, then this could be an atomic
+        // update document. Look for one of the atomic update operations as the value of the key to determine if this
+        // is an atomic update document. Once we find one key that is an atomic update operator, it is no longer
+        // necessary to keep looking at the rest of the keys in the map.
+        // The atomic update documents should be added to the atomicUpdateDocs and also removed from the inputDocuments.
         if (val instanceof Map) {
-          int entryCount = 0;
+          int entryCount = 0;   // Used only for log messages. If the log message below is removed, this may also be deleted.
           for (Map.Entry<String, Object> entry : ((Map<String, Object>) val).entrySet()) {
             String key = entry.getKey();
-            if (key.equals("add") || key.equals("set")|| key.equals("remove") || key.equals("removeregex") || key.equals("inc")) {
-              log.info("method:addAtomicUpdateDocuments - Found atomic update document [" + doc.toString() + "], docCount:[" + docCount + "], sifCount:[" + sifCount + "], entryCount:[" + entryCount + "]");
+            if (key.equals("add")    || key.equals("set")||
+                key.equals("remove") || key.equals("removeregex") ||
+                key.equals("inc")) {
+              log.info("method:addAtomicUpdateDocuments - Found atomic update document [" + doc.toString() +
+                       "], docCount:[" + docCount + "], solrInputFieldCount:[" + solrInputFieldCount + "], entryCount:[" + entryCount + "]");
+              // keep track of the time we saw this doc on the hbase side
+              doc.addField("_hbasets_tdt", DateUtil.getThreadLocalDateFormat().format(new Date()));
               atomicUpdateDocuments.add(doc);
               docIterator.remove();
               documentIsAtomic = true;
@@ -176,14 +186,15 @@ public class FusionDocumentWriter {
           }
         }
         // The document was determined to be an atomic update document, no need to visit the rest of the fields, so
-        // break from the sif loop.
+        // break from the solrInputField loop.
         if (documentIsAtomic) {
           break;
         }
-        sifCount++;
+        solrInputFieldCount++;
       }
       if (!documentIsAtomic) {
-        log.info("method:addAtomicUpdateDocuments - Found normal document to index [" + doc.toString() + "], docCount:[" + docCount + "], sifCount:[" + sifCount + "]");
+        log.info("method:addAtomicUpdateDocuments - Found normal document to index [" + doc.toString() + "], docCount:[" +
+                  docCount + "], solrInputFieldCount:[" + solrInputFieldCount + "]");
       }
       documentIsAtomic = false;
       docCount++;
@@ -252,12 +263,13 @@ public class FusionDocumentWriter {
       List<SolrInputDocument> childDocs = child.getChildDocuments();
       if (childDocs != null && !childDocs.isEmpty()) {
         log.info("Method:toJson - Processing SolrInputDocuments: parent:[" + (parent == null ? "null" : parent.toString()) +
-                "]; child is a nested document with " + childDocs.size() + " nested documents.\n" +
-                "Recursive call to 'toJsonDocs(child,childDocs,docCount)'.");
+                "]; child:[id:[" + child.getFieldValue("id").toString() + "]] is a parent document with " + childDocs.size() +
+                " nested documents.\n-----====>>>> Recursive call to 'toJsonDocs(child,childDocs,docCount)'.");
         //for (SolrInputDocument child : childDocs) {
         // docs.add(doc2json(doc, child, docCount++));
         docs.addAll(toJsonDocs(child, childDocs, docCount++));
-        //}
+        log.info("Method:toJson - \n<<<<====----- Recursive call for child:[id:[" + child.getFieldValue("id").toString() +
+                 "]] to 'toJsonDocs(child,childDocs,docCount)' is complete.\n\n");
       } else {
         // docs.add(doc2json(null, doc, docCount++));
         log.info("Method:toJson - Processing SolrInputDocuments: parent:[" + (parent == null ? "null" : parent.toString()) +
@@ -402,39 +414,67 @@ public class FusionDocumentWriter {
       (idsToDelete.subList(0,len).toString()+" + "+(idsToDelete.size()-len)+" more ...") : idsToDelete.toString();
     log.info("Sending a deleteById '"+idsToDelete+"' to Solr(s) at: "+solrProxies);
 
+    boolean deleteByIdsSucceeded = false;
     try {
       solrProxy.deleteById(idsToDelete, 500);
       indexDeleteMeter.mark(idsToDelete.size());
+      deleteByIdsSucceeded = true;
+      // This statement was inserted for Zendesk ticket 4186. If the delete by IDs succeeds above, we also need to ensure
+      // that all children documents that have the id (HBase row ID) in their id followed immediately by the
+      // deleteByQueryAppendString followed by any additional characters are also deleted from the index.
+      deleteByQuery(idsToDelete, "id", deleteByQueryAppendString);
     } catch (Exception e) {
-      log.error("Delete docs by id failed due to: "+e+"; ids: "+idsToDelete+". Retry deleting individually by id.");
-      retryDeletesIndividually(idsToDelete);
+      log.error("Delete docs by " + (deleteByIdsSucceeded ? "query" : "id") + " failed due to: "+e+"; ids: " +
+                 idsToDelete+ (deleteByIdsSucceeded ? " appended with '" + deleteByQueryAppendString : "") +
+                ". Retry deleting individually by id.");
+      retryDeletesIndividually(idsToDelete, deleteByIdsSucceeded);
     }
   }
 
-  private void retryDeletesIndividually(List<String> idsToDelete) throws SolrServerException, IOException {
+  /**
+   * If deleting the documents using a list of document IDs fails, then retry the deletes while iterating through the
+   * list of document IDs to be deleted. As the result of changes for ticket 4186, a delete by ID will also result in
+   * a delete by query attemp, where the id is postpended by a specific string. In the situation where there were
+   * nested (parent/child) documents submitted for indexing, the documents were denormalized and when this happens
+   * the document ID of the denormalized child documents contains the ID of the parent (the HBase row ID) followed by a
+   * specificpattern of characters followed by an additional string that uniquely identifies the child document. The
+   * delete by query will take the parent ID (HBase row ID) and append to it the specific pattern of characters followed
+   * by the wild card character ('*'). This will result in all child documents of the parent being deleted from the index.
+   * @param idsToDelete             The ID (HBase row ID) of the documents to be deleted
+   * @param retryDeletesByQueryOnly If the delete by IDs succeeded and only the delete by queries failed, this will be
+   *                                'true' to indicate that only the delete by query should be retried. If the value is
+   *                                'false', the delete by id failed, meaning that the delete by query was never
+   *                                attempted; thus, both the delete by id AND the delete by query must be attempted.
+   * @throws SolrServerException
+   * @throws IOException
+   */
+  private void retryDeletesIndividually(List<String> idsToDelete, boolean retryDeletesByQueryOnly) throws SolrServerException, IOException {
     for (String idToDelete : idsToDelete) {
-      try {
-        solrProxy.deleteById(idToDelete, 500);
-        indexDeleteMeter.mark();
-      } catch (SolrException e) {
-        log.error("Failed to delete document with ID "+idToDelete+" due to: "+e+". Retry deleting by query as '"+idToDelete+"|||*");
-        // shs: Changes here were made for Zendesk ticket 4186: Hbase row delete not deleting row in Fusion.
-        //      The problem reported is that when deleting by a parent document ID, after the denormalization of the
-        //      documents to be indexed, there are no documents with the parent document's ID (which is the HBase row
-        //      number). If the retryDeletesIndividually() fails, then a call will be made to deleteByQuery() with
-        //      the query string set to the value of idToDelete with the string "|||*" appended: <idToDelete>|||*. This
-        //      should enable Solr to delete all documents that originated from the specified HBase row ID, but which have
-        //      had their ID modified to include not only the original parent document's id, but have also had the
-        //      three pipe characters "|||" and any number of characters there after appended. Thus, a delete by query
-        //      where the query is "<HBaseRowId>|||*" should delete all child documents that came from that parent
-        //      documents row in the HBase table.
-        String deleteQuery = idToDelete + "|||*";
+      if (!retryDeletesByQueryOnly) {
         try {
-          deleteByQuery(deleteQuery);
-        } catch (SolrServerException ssExc) {
-          log.error("Delete doc by query after 'deleteById' failed due to: "+ssExc+", the delete query string was: 'deleteQuery'");
-          documentDeleteErrorMeter.mark();
+          solrProxy.deleteById(idToDelete, 500);
+          indexDeleteMeter.mark();
+        } catch (SolrException e) {
+          log.error("Failed to delete document with ID " + idToDelete + " due to: " + e + ". Retry deleting by query as '" +
+                  idToDelete + deleteByQueryAppendString + "'");
         }
+      }
+      // shs: Changes here (try/catch) were made for Zendesk ticket 4186: Hbase row delete not deleting row in Fusion.
+      //      The problem reported is that when deleting by a parent document ID, after the denormalization of the
+      //      documents to be indexed, there are no documents with the parent document's ID (which is the HBase row
+      //      number). If the retryDeletesIndividually() fails, then a call will be made to deleteByQuery() with
+      //      the query string set to the value of idToDelete with the string deleteByQueryAppendString appended:
+      //      <idToDelete>deleteByQueryAppendString. This should enable Solr to delete all documents that originated
+      //      from the specified HBase row ID, but which have had their ID modified to include not only the original
+      //      parent document's id, but have also had the three pipe characters '|||' and any number of characters
+      //      there after appended. Thus, a delete by query where the query is "<HBaseRowId>deleteByQueryAppendString"
+      //      should delete all child documents that came from that parent documents row in the HBase table.
+      try {
+        // Try to delete the document by query so as to remove all child documents from the index.
+        deleteByQuery(idToDelete + deleteByQueryAppendString);
+      } catch (SolrException e) {
+        log.error("Failed to delete document by query inside method 'retryDeletesIndividually' with ID " + idToDelete +
+                deleteByQueryAppendString + " due to: " + e + ".");
       }
     }
   }
@@ -444,7 +484,25 @@ public class FusionDocumentWriter {
     try {
       solrProxy.deleteByQuery(deleteQuery, 500);
     } catch (Exception e) {
-      log.error("Failed to execute deleteByQuery: "+deleteQuery+" due to: "+e);
+      log.error("Failed to execute deleteByQuery(String deleteQuery): "+deleteQuery+" due to: "+e);
+    }
+  }
+
+  private void deleteByQuery(String idToDelete, String queryFieldName, String deleteQueryAppendStr) throws SolrServerException, IOException {
+      try {
+        deleteByQuery(queryFieldName + ":" + idToDelete + deleteQueryAppendStr);
+      } catch (Exception e) {
+        log.error("Failed to execute deleteByQuery(String idToDelete, String deleteQueryAppendStr): " + idToDelete + deleteQueryAppendStr + " due to: " + e);
+      }
+  }
+
+  private void deleteByQuery(List<String> idsToDelete, String queryFieldName, String deleteQueryAppendStr) throws SolrServerException, IOException {
+    for (String idToDelete : idsToDelete) {
+      try {
+        deleteByQuery(queryFieldName + ":" + idToDelete + deleteQueryAppendStr);
+      } catch (Exception e) {
+        log.error("Failed to execute deleteByQuery(List<String> idsToDelete, String deleteQueryAppendStr): " + idToDelete + deleteQueryAppendStr + " due to: " + e);
+      }
     }
   }
 

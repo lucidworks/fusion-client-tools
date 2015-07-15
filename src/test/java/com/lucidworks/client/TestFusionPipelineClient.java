@@ -12,6 +12,7 @@ import java.util.Map;
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 
 public class TestFusionPipelineClient {
+  private static final Boolean useWireMockRule = false;
 
   @Rule
   public WireMockRule wireMockRule = new WireMockRule(8089); // No-args constructor defaults to port 8080
@@ -19,17 +20,27 @@ public class TestFusionPipelineClient {
   @Test
   public void testHappyPath() throws Exception {
 
-    String fusionUrl = "http://localhost:8089/api/pipeline";
+    String fusionUrl;
+    if (useWireMockRule) {
+      fusionUrl = "http://localhost:8764/api/pipeline";
+    } else {
+      // TODO: The following is very specific to a local Fusion install. Should do something to at least permit
+      //       users to specify the collection, the indexing pipeline, etc. to be used instead of this hard coded
+      //       URL when connecting to a real Fusion instance.
+      fusionUrl = "http://localhost:8764/api/apollo/index-pipelines/scottsCollection-default/collections/agentCollection/index";
+    }
     String fusionUser = "admin";
     String fusionPass = "password123";
-    String fusionRealm = "default";
+    String fusionRealm = "native";
 
-    // mock out the Pipeline API
-    stubFor(post(urlEqualTo("/api/pipeline")).willReturn(aResponse().withStatus(200)));
+    if (useWireMockRule) {
+      // mock out the Pipeline API
+      stubFor(post(urlEqualTo("/api/pipeline")).willReturn(aResponse().withStatus(200)));
 
-    // mock out the Session API
-    stubFor(post(urlEqualTo("/api/session?realmName="+fusionRealm)).willReturn(aResponse().withStatus(200)));
+      // mock out the Session API
+      stubFor(post(urlEqualTo("/api/session?realmName=" + fusionRealm)).willReturn(aResponse().withStatus(200)));
 
+    }
     FusionPipelineClient pipelineClient =
       new FusionPipelineClient(fusionUrl, fusionUser, fusionPass, fusionRealm);
     pipelineClient.postBatchToPipeline(buildDocs(1));
