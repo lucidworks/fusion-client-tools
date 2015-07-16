@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit;
  */
 public class FusionDocumentWriter {
 
-  private final Log log = LogFactory.getLog(FusionDocumentWriter.class);
+  private static final Log log = LogFactory.getLog(FusionPipelineClient.class);
 
   public static MetricName metricName(Class<?> producerClass, String metric, String indexerName) {
     return new MetricName("hbaseindexer", producerClass.getSimpleName(), metric, indexerName);
@@ -236,24 +236,12 @@ public class FusionDocumentWriter {
    * @throws Exception
    */
   protected List<Map<String,Object>> toJson(SolrInputDocument parent, SolrInputDocument child, int docCount) throws Exception {
-    log.info("Method:toJson - Processing SolrInputDocuments: parent:["+ (parent==null ? "null" : parent.toString()) +
-             "]; child[" + (child==null ? "null" : child.toString()) + "]; docCount:[" + docCount + "].");
     List<Map<String,Object>> docs = new ArrayList<Map<String, Object>>();
     if (child != null) {
       List<SolrInputDocument> childDocs = child.getChildDocuments();
       if (childDocs != null && !childDocs.isEmpty()) {
-        log.info("Method:toJson - Processing SolrInputDocuments: parent:[" + (parent == null ? "null" : parent.toString()) +
-                "]; child:[id:[" + child.getFieldValue("id").toString() + "]] is a parent document with " + childDocs.size() +
-                " nested documents.\n-----====>>>> Recursive call to 'toJsonDocs(child,childDocs,docCount)'.");
-        //for (SolrInputDocument child : childDocs) {
-        // docs.add(doc2json(doc, child, docCount++));
         docs.addAll(toJsonDocs(child, childDocs, docCount++));
-        log.info("Method:toJson - \n<<<<====----- Recursive call for child:[id:[" + child.getFieldValue("id").toString() +
-                 "]] to 'toJsonDocs(child,childDocs,docCount)' is complete.\n\n");
       } else {
-        // docs.add(doc2json(null, doc, docCount++));
-        log.info("Method:toJson - Processing SolrInputDocuments: parent:[" + (parent == null ? "null" : parent.toString()) +
-                "]; child:[" + child.toString() + "]. Calling doc2json.");
         // I'm not certain the increment should be on the docCount here...
         docs.add(doc2json(parent, child, docCount++));
       }
@@ -274,8 +262,6 @@ public class FusionDocumentWriter {
    *                  Fusion.
    */
   protected Map<String,Object> doc2json(SolrInputDocument parent, SolrInputDocument child, int docCount) {
-    log.info("Method:doc2json - Processing SolrInputDocuments: parent:["+ (parent==null ? "null" : parent.toString()) +
-            "]; child[" + (child==null ? "null" : child.toString()) + "]; docCount:[" + docCount + "].");
     Map<String,Object> json = new HashMap<String,Object>();
     if (child != null) {
       String docId = (String) child.getFieldValue("id");
@@ -302,23 +288,16 @@ public class FusionDocumentWriter {
             appendField(child, f, "_p_", fields);
           }
         }
-        log.info("Method:doc2json - After merging parent and child docs, parent:[" + parent.toString() +
-                "]; child[" + child.toString() + "].");
       }
-
       for (String f : child.getFieldNames()) {
         if (!"id".equals(f)) { // id already added
           appendField(child, f, null, fields);
-          log.info("Method:doc2json - After appending fields parent:[" + (parent == null ? "null" : parent.toString()) +
-                  "]; child[" + child.toString() + "].");
         }
       }
-
       // keep track of the time we saw this doc on the hbase side
       fields.add(mapField("_hbasets_tdt", null, DateUtil.getThreadLocalDateFormat().format(new Date())));
 
       json.put("fields", fields);
-      log.info("Method:doc2json - Merged JSON document being returned:[" + json + "].");
     } else {
       log.warn("method:doc2json - Input parameter 'child' was null.");
     }
@@ -459,13 +438,13 @@ public class FusionDocumentWriter {
     }
   }
 
-  private void deleteByQuery(String idToDelete, String queryFieldName, String deleteQueryAppendStr) throws SolrServerException, IOException {
-      try {
-        deleteByQuery(queryFieldName + ":" + idToDelete + deleteQueryAppendStr);
-      } catch (Exception e) {
-        log.error("Failed to execute deleteByQuery(String idToDelete, String deleteQueryAppendStr): " + idToDelete + deleteQueryAppendStr + " due to: " + e);
-      }
-  }
+//  private void deleteByQuery(String idToDelete, String queryFieldName, String deleteQueryAppendStr) throws SolrServerException, IOException {
+//      try {
+//        deleteByQuery(queryFieldName + ":" + idToDelete + deleteQueryAppendStr);
+//      } catch (Exception e) {
+//        log.error("Failed to execute deleteByQuery(String idToDelete, String deleteQueryAppendStr): " + idToDelete + deleteQueryAppendStr + " due to: " + e);
+//      }
+//  }
 
   private void deleteByQuery(List<String> idsToDelete, String queryFieldName, String deleteQueryAppendStr) throws SolrServerException, IOException {
     for (String idToDelete : idsToDelete) {

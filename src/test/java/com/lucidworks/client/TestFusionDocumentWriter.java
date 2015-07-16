@@ -47,16 +47,15 @@ public class TestFusionDocumentWriter {
   private static String fusionSolrProxyUrlExtension;
   private static Boolean useWireMockRule;
 
-  static Log log = LogFactory.getLog(FusionDocumentWriter.class);
+  private static final Log log = LogFactory.getLog(FusionPipelineClient.class);
 
   static {
-
 
     try (InputStream in = new FileInputStream("properties/properties.xml")) {
       Properties prop = new Properties();
       prop.loadFromXML(in);
 
-      useWireMockRule = Boolean.getBoolean(prop.getProperty("useWireMockRule"));
+      useWireMockRule = Boolean.getBoolean(prop.getProperty("useWireMockRule", Boolean.toString(true)));
       if (useWireMockRule) {
         // Set host and port when using WireMockRules.
         host = prop.getProperty("wireMockRuleHost", defaultHost);

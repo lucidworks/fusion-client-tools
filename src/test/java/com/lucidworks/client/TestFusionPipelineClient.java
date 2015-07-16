@@ -42,10 +42,9 @@ public class TestFusionPipelineClient {
   private static String fusionSolrProxyUrlExtension;
   private static Boolean useWireMockRule;
 
-  static Log log = LogFactory.getLog(FusionDocumentWriter.class);
+  private static final Log log = LogFactory.getLog(FusionPipelineClient.class);
 
   static {
-
 
     try (InputStream in = new FileInputStream("properties/properties.xml")) {
       Properties prop = new Properties();
@@ -95,7 +94,6 @@ public class TestFusionPipelineClient {
       throw new RuntimeException();
     }
   }
-
 
   @Rule
   public WireMockRule wireMockRule = new WireMockRule(Integer.parseInt(wireMockRulePort)); // No-args constructor defaults to port 8080
