@@ -94,7 +94,7 @@ public class FusionDocumentWriter {
     documentDeleteErrorMeter = Metrics.newMeter(metricName(getClass(), "Document delete errors", indexName),
       "Documents not deleted from Solr due to document errors", TimeUnit.SECONDS);
 
-    log.info("Fusion document writer initialized successfully for " + fusionEndpoint);
+    log.info("Fusion document writer initialized successfully for Fusion end point:[" + fusionEndpoint + "]");
   }
 
   public void add(int shard, Map<String, SolrInputDocument> inputDocumentMap) throws SolrServerException, IOException {
@@ -113,19 +113,12 @@ public class FusionDocumentWriter {
     //      the atomic updates have been processed.
     if (inputDocuments != null && !inputDocuments.isEmpty()) {
       List<Map<String, Object>> fusionDocs = new ArrayList<Map<String, Object>>(inputDocuments.size());
-      log.info("Method:add - inputDocuments.size():[" + inputDocuments.size() + "], inputDocuments:[" + inputDocuments.toString() +
-              "], fusionDocs:[" + fusionDocs + "]. Call toJsonDocs(null, inputDocuments, 0");
       try {
         fusionDocs = toJsonDocs(null, inputDocuments, 0);
       } catch (Exception exc) {
         throw new RuntimeException(exc);
       }
-      log.info("Method:add - after return from toJsonDocs(null, inputDocuments, 0): fusionDocs.size():[" + fusionDocs.size() +
-               "], fusionDocs:[" + fusionDocs.toString() + "].");
       try {
-        log.info("Method:add - sending fusionDocs to indexing pipeline:[" + fusionDocs.size() +
-                "], fusionDocs:[" + fusionDocs.toString() + "].");
-
         pipelineClient.postBatchToPipeline(fusionDocs);
         indexAddMeter.mark(fusionDocs.size());
       } catch (Exception e) {
@@ -146,15 +139,9 @@ public class FusionDocumentWriter {
   protected Collection<SolrInputDocument> addAtomicUpdateDocuments(Collection<SolrInputDocument> inputDocuments)
           throws SolrServerException, IOException  {
     // Visit each document in the collection and determine if it is a document that is an atomic update request. If it
-    // is then add it to the atomicUpdateDocs and remove it from inputDocuments. The documents that are determined to be
-    // atomic update type documents will be sent directly to the solr proxy for indexing, thereby using the Fusion Solr
-    // service for ONLY those documents that have atomic updates in them. The rest of the documents, without atomic
-    // updates as contained in the collection inputDocuments will be returned for processing by the Fusion pipeline.
+    // is then add it to the atomicUpdateDocs and remove it from inputDocuments.
     Collection<SolrInputDocument> atomicUpdateDocuments = new ArrayList<SolrInputDocument>();
 
-    // This for loop utilizes an iterator which makes it possible to remove items from the inputDocuments collection
-    // without getting a concurrent update exception.
-    int docCount = 0;
     boolean documentIsAtomic = false;
     for (Iterator<SolrInputDocument> docIterator = inputDocuments.iterator(); docIterator.hasNext();) {
       SolrInputDocument doc = docIterator.next();
@@ -162,10 +149,7 @@ public class FusionDocumentWriter {
       for (SolrInputField solrInputField : doc.values()) {
         Object val = solrInputField.getValue();
         // If the type of the field just retrieved from the document is a Map object, then this could be an atomic
-        // update document. Look for one of the atomic update operations as the value of the key to determine if this
-        // is an atomic update document. Once we find one key that is an atomic update operator, it is no longer
-        // necessary to keep looking at the rest of the keys in the map.
-        // The atomic update documents should be added to the atomicUpdateDocs and also removed from the inputDocuments.
+        // update document.
         if (val instanceof Map) {
           int entryCount = 0;   // Used only for log messages. If the log message below is removed, this may also be deleted.
           for (Map.Entry<String, Object> entry : ((Map<String, Object>) val).entrySet()) {
@@ -173,11 +157,12 @@ public class FusionDocumentWriter {
             if (key.equals("add")    || key.equals("set")||
                 key.equals("remove") || key.equals("removeregex") ||
                 key.equals("inc")) {
-              log.info("method:addAtomicUpdateDocuments - Found atomic update document [" + doc.toString() +
-                       "], docCount:[" + docCount + "], solrInputFieldCount:[" + solrInputFieldCount + "], entryCount:[" + entryCount + "]");
               // keep track of the time we saw this doc on the hbase side
               doc.addField("_hbasets_tdt", DateUtil.getThreadLocalDateFormat().format(new Date()));
+              // The atomic update documents should be added to the atomicUpdateDocs...
               atomicUpdateDocuments.add(doc);
+              // ...and also removed from the inputDocuments by using the docIterator.remove() method to avoid a
+              // concurrent update exception.
               docIterator.remove();
               documentIsAtomic = true;
               break; // from the entry for loop
@@ -192,12 +177,7 @@ public class FusionDocumentWriter {
         }
         solrInputFieldCount++;
       }
-      if (!documentIsAtomic) {
-        log.info("method:addAtomicUpdateDocuments - Found normal document to index [" + doc.toString() + "], docCount:[" +
-                  docCount + "], solrInputFieldCount:[" + solrInputFieldCount + "]");
-      }
       documentIsAtomic = false;
-      docCount++;
     }
 
     // The following processing is necessary IFF there are documents in the atomicUpdateDocuments collection, which
@@ -440,6 +420,7 @@ public class FusionDocumentWriter {
    * specificpattern of characters followed by an additional string that uniquely identifies the child document. The
    * delete by query will take the parent ID (HBase row ID) and append to it the specific pattern of characters followed
    * by the wild card character ('*'). This will result in all child documents of the parent being deleted from the index.
+   *
    * @param idsToDelete             The ID (HBase row ID) of the documents to be deleted
    * @param retryDeletesByQueryOnly If the delete by IDs succeeded and only the delete by queries failed, this will be
    *                                'true' to indicate that only the delete by query should be retried. If the value is
@@ -459,18 +440,8 @@ public class FusionDocumentWriter {
                   idToDelete + deleteByQueryAppendString + "'");
         }
       }
-      // shs: Changes here (try/catch) were made for Zendesk ticket 4186: Hbase row delete not deleting row in Fusion.
-      //      The problem reported is that when deleting by a parent document ID, after the denormalization of the
-      //      documents to be indexed, there are no documents with the parent document's ID (which is the HBase row
-      //      number). If the retryDeletesIndividually() fails, then a call will be made to deleteByQuery() with
-      //      the query string set to the value of idToDelete with the string deleteByQueryAppendString appended:
-      //      <idToDelete>deleteByQueryAppendString. This should enable Solr to delete all documents that originated
-      //      from the specified HBase row ID, but which have had their ID modified to include not only the original
-      //      parent document's id, but have also had the three pipe characters '|||' and any number of characters
-      //      there after appended. Thus, a delete by query where the query is "<HBaseRowId>deleteByQueryAppendString"
-      //      should delete all child documents that came from that parent documents row in the HBase table.
+      // Try to delete the document by query so as to remove all child documents from the index.
       try {
-        // Try to delete the document by query so as to remove all child documents from the index.
         deleteByQuery(idToDelete + deleteByQueryAppendString);
       } catch (SolrException e) {
         log.error("Failed to delete document by query inside method 'retryDeletesIndividually' with ID " + idToDelete +

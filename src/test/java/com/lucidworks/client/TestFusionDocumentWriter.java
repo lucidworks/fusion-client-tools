@@ -4,7 +4,6 @@ import com.github.tomakehurst.wiremock.http.Request;
 import com.github.tomakehurst.wiremock.http.RequestListener;
 import com.github.tomakehurst.wiremock.http.Response;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
-import org.apache.hadoop.util.hash.Hash;
 import org.apache.solr.common.SolrInputDocument;
 import org.codehaus.jackson.JsonNode;
 import org.junit.Rule;
@@ -13,42 +12,108 @@ import static org.junit.Assert.*;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.io.*;
+import java.util.*;
 
 import org.codehaus.jackson.map.ObjectMapper;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 
 public class TestFusionDocumentWriter {
+  private static final String defaultWireMockRulePort = "8089";
+  private static final String defaultFusionPort = "8764";
+  private static final String defaultHost = "localhost";
+  private static final String defaultCollection = "test";
+  private static final String defaultFusionIndexingPipeline = "conn_solr";
+  private static final String defaultFusionProxyBaseUrl = "api/apollo";
+  private static final String defaultFusionIndexingPipelineUrlExtension = "index-pipelines";
+  private static final String defaultFusionSessionApi = "/api/session?realmName=";
+  private static final String defaultFusionUser = "admin";
+  private static final String defaultFusionPass = "password123";
+  private static final String defaultFusionRealm = "native";
+  private static final String defaultFusionSolrProxyUrlExtension = "solr";
 
-  private static final Boolean useWireMockRule = false;
+  private static String host;
+  private static String port;
+  private static String wireMockRulePort;
+  private static String fusionCollection;
+  private static String fusionIndexingPipeline;
+  private static String fusionProxyBaseUrl;
+  private static String fusionIndexingPipelineUrlExtension;
+  private static String fusionSessionApi;
+  private static String fusionUser;
+  private static String fusionPass;
+  private static String fusionRealm;
+  private static String fusionSolrProxyUrlExtension;
+  private static Boolean useWireMockRule;
 
-  private Log log = LogFactory.getLog(FusionDocumentWriter.class);
+  static Log log = LogFactory.getLog(FusionDocumentWriter.class);
+
+  static {
+
+
+    try (InputStream in = new FileInputStream("properties/properties.xml")) {
+      Properties prop = new Properties();
+      prop.loadFromXML(in);
+
+      useWireMockRule = Boolean.getBoolean(prop.getProperty("useWireMockRule"));
+      if (useWireMockRule) {
+        // Set host and port when using WireMockRules.
+        host = prop.getProperty("wireMockRuleHost", defaultHost);
+        port = prop.getProperty("wireMockRulePort", defaultWireMockRulePort);
+        wireMockRulePort = port;
+      } else {
+        // Set host and port when connecting to Fusion.
+        host = prop.getProperty("fusionHost", defaultHost);
+        port = prop.getProperty("fusionApiPort", defaultFusionPort);
+        wireMockRulePort = defaultWireMockRulePort;
+      }
+
+      // Set collection.
+      fusionCollection = prop.getProperty("fusionCollection", defaultCollection);
+
+      // Set the fusion indexing pipeline.
+      fusionIndexingPipeline = prop.getProperty("fusionIndexingPipeline", defaultFusionIndexingPipeline);
+
+      // Set the fusion proxy base URL.
+      fusionProxyBaseUrl = prop.getProperty("fusionProxyBaseUrl", defaultFusionProxyBaseUrl);
+
+      // Set the fusion indexing pipeline URL extension.
+      fusionIndexingPipelineUrlExtension = prop.getProperty("fusionIndexingPipelineUrlExtension", defaultFusionIndexingPipelineUrlExtension);
+
+      // Set the fusion session API.
+      fusionSessionApi = prop.getProperty("fusionSessionApi", defaultFusionSessionApi);
+
+      // Set the fusion user.
+      fusionUser = prop.getProperty("fusionUser", defaultFusionUser);
+
+      // Set the fusion password.
+      fusionPass = prop.getProperty("fusionPass", defaultFusionPass);
+
+      // Set the fusion realm.
+      fusionRealm = prop.getProperty("fusionRealm", defaultFusionRealm);
+
+      // Set the fusion solr proxy URL extension.
+      fusionSolrProxyUrlExtension = prop.getProperty("fusionSolrProxyUrlExtension", defaultFusionSolrProxyUrlExtension);
+    } catch (IOException e) {
+      log.error("Error reading properties.xml file due to exception:[" + e.toString() + "]");
+      throw new RuntimeException();
+    }
+  }
+
 
   @Rule
-  public WireMockRule wireMockRule = new WireMockRule(8089); // No-args constructor defaults to port 8080
+  public WireMockRule wireMockRule = new WireMockRule(Integer.parseInt(wireMockRulePort)); // No-args constructor defaults to port 8080
 
   @Test
   public void testFusionDocumentWriter() throws Exception {
-    String fusionUrl;
-    String fusionSolrProxy;
-    if (useWireMockRule) {
-      fusionUrl = "http://localhost:8089/api/pipeline";
-      fusionSolrProxy = "http://localhost:8089/api/solr";
-    } else {
-      // TODO: The following is very specific to a local Fusion install. Should do something to at least permit
-      //       users to specify the collection, the indexing pipeline, etc. to be used instead of this hard coded
-      //       URL when connecting to a real Fusion instance.
-      fusionUrl = "http://localhost:8764/api/apollo/index-pipelines/scottsCollection-default/collections/agentCollection/index";
-      fusionSolrProxy = "http://localhost:8764/api/apollo/solr/agentCollection";
-    }
-    String fusionUser = "admin";
-    String fusionPass = "password123";
-    String fusionRealm = "native";
+
+    String fusionHostAndPort = "http://" + host + ":" + port;
+    String fusionPipelineUrlWithoutHostAndPort = "/" + fusionProxyBaseUrl + "/" + fusionIndexingPipelineUrlExtension + "/" +
+           fusionIndexingPipeline + "/collections/" + fusionCollection + "/index";
+    String fusionUrl = fusionHostAndPort + fusionPipelineUrlWithoutHostAndPort;
+    String fusionSolrProxyWithoutHostAndPort = "/" + defaultFusionProxyBaseUrl + "/" + fusionSolrProxyUrlExtension + "/" + fusionCollection;
+    String fusionSolrProxy = fusionHostAndPort + fusionSolrProxyWithoutHostAndPort;
 
     Map<String,String> config = new HashMap<String,String>();
     config.put("fusion.pipeline", fusionUrl);
@@ -57,17 +122,23 @@ public class TestFusionDocumentWriter {
     config.put("fusion.pass", fusionPass);
     config.put("fusion.realm", fusionRealm);
 
+
     if (useWireMockRule) {
       // mock out the Pipeline API
-      stubFor(post(urlEqualTo("/api/pipeline")).willReturn(aResponse().withStatus(200)));
+      // stubFor(post(urlEqualTo("/api/apollo/index-pipelines")).willReturn(aResponse().withStatus(200)));
+      stubFor(post(urlEqualTo(fusionPipelineUrlWithoutHostAndPort)).willReturn(aResponse().withStatus(200)));
 
       // mock out the Session API
-      stubFor(post(urlEqualTo("/api/session?realmName="+fusionRealm)).willReturn(aResponse().withStatus(200)));
+      // stubFor(post(urlEqualTo("/api/session?realmName="+fusionRealm)).willReturn(aResponse().withStatus(200)));
+      stubFor(post(urlEqualTo(fusionSessionApi + fusionRealm)).willReturn(aResponse().withStatus(200)));
 
       // mock out the Solr proxy
-      stubFor(post(urlEqualTo("/api/solr")).willReturn(aResponse().withStatus(200)));
+      // stubFor(post(urlEqualTo("/api/apollo/solr")).willReturn(aResponse().withStatus(200)));
+      stubFor(post(urlEqualTo(fusionSolrProxyWithoutHostAndPort)).willReturn(aResponse().withStatus(200)));
+
     }
-    FusionDocumentWriter docWriter = new FusionDocumentWriter("agentCollection" /* indexName */, config);
+    // FusionDocumentWriter docWriter = new FusionDocumentWriter("agentCollection" /* indexName */, config);
+    FusionDocumentWriter docWriter = new FusionDocumentWriter(fusionCollection /* indexName */, config);
 
     if (useWireMockRule) {
       // register a callback to validate the request that came into our mock pipeline endpoint
@@ -78,13 +149,16 @@ public class TestFusionDocumentWriter {
       });
     }
 
+    log.info("======================================================================================");
     log.info("Adding one document from buildInputDocs().");
     docWriter.add(1, buildInputDocs(1, 0));
-    log.info("\nAdding two documents from buildAtomicUpdateDocs().");
+    log.info("\n\n======================================================================================");
+    log.info("Adding two documents from buildAtomicUpdateDocs().");
     docWriter.add(1, buildAtomicUpdateDocs(2, 0));
 
-    log.info("\n\nStarting homoginized list of documents...");
-    Map<String, SolrInputDocument> homoginizedDocuments = buildInputDocs(1,0);
+    log.info("\n\n======================================================================================");
+    log.info("Starting homoginized list of documents...");
+    Map<String, SolrInputDocument> homoginizedDocuments = buildInputDocs(1, 0);
     homoginizedDocuments.putAll(buildAtomicUpdateDocs(2, 2));
     homoginizedDocuments.putAll(buildInputDocs(1, 10));
     homoginizedDocuments.putAll(buildAtomicUpdateDocs(1, 13));
@@ -92,8 +166,8 @@ public class TestFusionDocumentWriter {
     log.info("\n\nAdding homoginized documents. Total documents:[" + homoginizedDocuments.toString() + "]");
     docWriter.add(1, homoginizedDocuments);
 
-    log.info("======================================================================================");
-    log.info("\n\nAdding nested documents.");
+    log.info("\n\n======================================================================================");
+    log.info("Adding nested documents.");
     docWriter.add(1, buildNestedDocs(4, 1));
     log.info("\n\nFinished adding nested documents.");
     log.info("======================================================================================");
