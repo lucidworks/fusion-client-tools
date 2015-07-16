@@ -14,24 +14,27 @@ import java.util.*;
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 
 public class TestFusionPipelineClient {
-
   private static final String defaultWireMockRulePort = "8089";
   private static final String defaultFusionPort = "8764";
+  private static final String defaultFusionServerHttpString = "http://";
   private static final String defaultHost = "localhost";
   private static final String defaultCollection = "test";
   private static final String defaultFusionIndexingPipeline = "conn_solr";
-  private static final String defaultFusionProxyBaseUrl = "api/apollo";
-  private static final String defaultFusionIndexingPipelineUrlExtension = "index-pipelines";
+  private static final String defaultFusionProxyBaseUrl = "/api/apollo";
+  private static final String defaultFusionIndexingPipelineUrlExtension = "/index-pipelines";
   private static final String defaultFusionSessionApi = "/api/session?realmName=";
   private static final String defaultFusionUser = "admin";
   private static final String defaultFusionPass = "password123";
   private static final String defaultFusionRealm = "native";
-  private static final String defaultFusionSolrProxyUrlExtension = "solr";
+  private static final String defaultFusionIndexingPipelineUrlTerminatingString = "/index";
+  private static final String defaultFusionSolrProxyUrlExtension = "/solr";
 
-  private static String host;
-  private static String port;
-  private static String wireMockRulePort;
+  private static String fusionServerHttpString;
+  private static String fusionHost;
+  private static String fusionApiPort;
+  private static String wireMockRulePort = defaultWireMockRulePort;
   private static String fusionCollection;
+  private static String fusionCollectionForUrl;
   private static String fusionIndexingPipeline;
   private static String fusionProxyBaseUrl;
   private static String fusionIndexingPipelineUrlExtension;
@@ -40,7 +43,7 @@ public class TestFusionPipelineClient {
   private static String fusionPass;
   private static String fusionRealm;
   private static String fusionSolrProxyUrlExtension;
-  private static Boolean useWireMockRule;
+  private static Boolean useWireMockRule = true;
 
   private static final Log log = LogFactory.getLog(FusionPipelineClient.class);
 
@@ -50,24 +53,27 @@ public class TestFusionPipelineClient {
       Properties prop = new Properties();
       prop.loadFromXML(in);
 
-      useWireMockRule = Boolean.getBoolean(prop.getProperty("useWireMockRule"));
+      useWireMockRule = "true".equalsIgnoreCase(String.valueOf(prop.getProperty("useWireMockRule", "true")));
       if (useWireMockRule) {
         // Set host and port when using WireMockRules.
-        host = prop.getProperty("wireMockRuleHost", defaultHost);
-        port = prop.getProperty("wireMockRulePort", defaultWireMockRulePort);
-        wireMockRulePort = port;
+        fusionHost = prop.getProperty("wireMockRuleHost", defaultHost) + ":";
+        fusionApiPort = prop.getProperty("wireMockRulePort", defaultWireMockRulePort);
+        wireMockRulePort = fusionApiPort;
       } else {
         // Set host and port when connecting to Fusion.
-        host = prop.getProperty("fusionHost", defaultHost);
-        port = prop.getProperty("fusionApiPort", defaultFusionPort);
-        wireMockRulePort = defaultWireMockRulePort;
+        fusionHost = prop.getProperty("fusionHost", defaultHost) + ":";
+        fusionApiPort = prop.getProperty("fusionApiPort", defaultFusionPort);
       }
+
+      // Set http string (probably always either http:// or https://).
+      fusionServerHttpString = prop.getProperty("fusionServerHttpString", defaultFusionServerHttpString);
 
       // Set collection.
       fusionCollection = prop.getProperty("fusionCollection", defaultCollection);
+      fusionCollectionForUrl = "/" + fusionCollection;
 
       // Set the fusion indexing pipeline.
-      fusionIndexingPipeline = prop.getProperty("fusionIndexingPipeline", defaultFusionIndexingPipeline);
+      fusionIndexingPipeline = "/" +  prop.getProperty("fusionIndexingPipeline", defaultFusionIndexingPipeline);
 
       // Set the fusion proxy base URL.
       fusionProxyBaseUrl = prop.getProperty("fusionProxyBaseUrl", defaultFusionProxyBaseUrl);
@@ -95,18 +101,20 @@ public class TestFusionPipelineClient {
     }
   }
 
+  private static final String fusionCollectionApiStrValForUrl = "/collections";
+
   @Rule
   public WireMockRule wireMockRule = new WireMockRule(Integer.parseInt(wireMockRulePort)); // No-args constructor defaults to port 8080
-//  public WireMockRule wireMockRule = new WireMockRule(8089); // No-args constructor defaults to port 8080
 
   @Test
   public void testHappyPath() throws Exception {
 
-    String fusionHostAndPort = "http://" + host + ":" + port;
-    String fusionPipelineUrlWithoutHostAndPort = "/" + fusionProxyBaseUrl + "/" + fusionIndexingPipelineUrlExtension + "/" +
-            fusionIndexingPipeline + "/collections/" + fusionCollection + "/index";
+    String fusionHostAndPort = "http://" + fusionHost + fusionApiPort;
+    String fusionPipelineUrlWithoutHostAndPort = fusionProxyBaseUrl + fusionIndexingPipelineUrlExtension +
+           fusionIndexingPipeline + fusionCollectionApiStrValForUrl + fusionCollectionForUrl +
+           defaultFusionIndexingPipelineUrlTerminatingString;
     String fusionUrl = fusionHostAndPort + fusionPipelineUrlWithoutHostAndPort;
-    String fusionSolrProxyWithoutHostAndPort = "/" + fusionSolrProxyUrlExtension + "/" + fusionCollection;
+    String fusionSolrProxyWithoutHostAndPort = fusionSolrProxyUrlExtension + fusionCollectionForUrl;
 
     if (useWireMockRule) {
       // mock out the Pipeline API
