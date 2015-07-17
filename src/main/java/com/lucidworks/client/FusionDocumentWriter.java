@@ -240,6 +240,7 @@ public class FusionDocumentWriter {
     if (child != null) {
       List<SolrInputDocument> childDocs = child.getChildDocuments();
       if (childDocs != null && !childDocs.isEmpty()) {
+        // Recursive call back to 'toJsonDocs()'
         docs.addAll(toJsonDocs(child, childDocs, docCount++));
       } else {
         // I'm not certain the increment should be on the docCount here...
@@ -285,7 +286,7 @@ public class FusionDocumentWriter {
           if ("id".equals(f)) {
             fields.add(mapField("_p_id_s", null /* field name prefix */, parent.getField("id").getFirstValue()));
           } else {
-            appendField(child, f, "_p_", fields);
+            appendField(parent, f, "_p_", fields);
           }
         }
       }
