@@ -116,19 +116,31 @@ public class TestFusionPipelineClient {
     String fusionUrl = fusionHostAndPort + fusionPipelineUrlWithoutHostAndPort;
     String fusionSolrProxyWithoutHostAndPort = fusionSolrProxyUrlExtension + fusionCollectionForUrl;
 
+    log.info("testHappyPath running with: fusionSolrProxyWithoutHostAndPort=" + fusionSolrProxyWithoutHostAndPort +
+      " fusionPipelineUrlWithoutHostAndPort=" + fusionPipelineUrlWithoutHostAndPort +
+      " wireMockRulePort=" + wireMockRulePort + " useWireMockRule=" + useWireMockRule);
+
+    String badPath = "/api/apollo/index-pipelines/scottsCollection-default/collections/badCollection/index";
     if (useWireMockRule) {
       // mock out the Pipeline API
       //  stubFor(post(urlEqualTo("/api/apollo/index-pipelines")).willReturn(aResponse().withStatus(200)));
       stubFor(post(urlEqualTo(fusionPipelineUrlWithoutHostAndPort)).willReturn(aResponse().withStatus(200)));
 
-      // mock out the Session API
-      // stubFor(post(urlEqualTo("/api/session?realmName=" + fusionRealm)).willReturn(aResponse().withStatus(200)));
-      stubFor(post(urlEqualTo(fusionSolrProxyWithoutHostAndPort + fusionRealm)).willReturn(aResponse().withStatus(200)));
+      // a bad node in the mix ... to test FusionPipelineClient error handling
+      stubFor(post(urlEqualTo(badPath)).willReturn(aResponse().withStatus(500)));
 
+      // mock out the Session API
+      stubFor(post(urlEqualTo("/api/session?realmName=" + fusionRealm)).willReturn(aResponse().withStatus(200)));
     }
+
+    String fusionEndpoints = fusionUrl+",http://localhost:"+wireMockRulePort+"/not_and_endpoint/api,http://localhost:"+wireMockRulePort+badPath;
+
     FusionPipelineClient pipelineClient =
-      new FusionPipelineClient(fusionUrl, fusionUser, fusionPass, fusionRealm);
-    pipelineClient.postBatchToPipeline(buildDocs(1));
+      new FusionPipelineClient(fusionEndpoints, fusionUser, fusionPass, fusionRealm);
+
+    for (int i=0; i < 10; i++) {
+      pipelineClient.postBatchToPipeline(buildDocs(1));
+    }
   }
 
   protected List<Map<String,Object>> buildDocs(int numDocs) {
