@@ -69,6 +69,8 @@ public class FusionDocumentWriter {
     }
 
     try {
+      log.info("method:FusionDocumentWriter: Create Solr proxy next; fusionSolrProxy:[" + fusionSolrProxy +
+               "], indexName:[" + indexName + "].");
       solrProxy = new LBHttpSolrServer(pipelineClient.getHttpClient(), fusionSolrProxy.split(","));
     } catch (Exception exc) {
       log.error("Failed to create LBHttpSolrServer for "+fusionSolrProxy+" due to: "+exc);
@@ -145,7 +147,7 @@ public class FusionDocumentWriter {
     boolean documentIsAtomic = false;
     for (Iterator<SolrInputDocument> docIterator = inputDocuments.iterator(); docIterator.hasNext();) {
       SolrInputDocument doc = docIterator.next();
-      int solrInputFieldCount = 0;
+//      int solrInputFieldCount = 0;
       for (SolrInputField solrInputField : doc.values()) {
         Object val = solrInputField.getValue();
         // If the type of the field just retrieved from the document is a Map object, then this could be an atomic
@@ -158,7 +160,11 @@ public class FusionDocumentWriter {
                 key.equals("remove") || key.equals("removeregex") ||
                 key.equals("inc")) {
               // keep track of the time we saw this doc on the hbase side
-              doc.addField("_hbasets_tdt", DateUtil.getThreadLocalDateFormat().format(new Date()));
+              Map<String,String> atomicUpdateMap = new HashMap<String, String>();
+              atomicUpdateMap.put("set", DateUtil.getThreadLocalDateFormat().format(new Date()));
+              doc.addField("_hbasets_tdt", atomicUpdateMap);
+//                doc.addField("_hbasets_tdt", DateUtil.getThreadLocalDateFormat().format(new Date()));
+
               // The atomic update documents should be added to the atomicUpdateDocs...
               atomicUpdateDocuments.add(doc);
               // ...and also removed from the inputDocuments by using the docIterator.remove() method to avoid a
@@ -175,7 +181,7 @@ public class FusionDocumentWriter {
         if (documentIsAtomic) {
           break;
         }
-        solrInputFieldCount++;
+//        solrInputFieldCount++;
       }
       documentIsAtomic = false;
     }
@@ -188,7 +194,7 @@ public class FusionDocumentWriter {
       // need to be converted to JSON.
       try {
         // Submit atomic update documents to Solr at this point.
-        solrProxy.add(atomicUpdateDocuments);
+        solrProxy.add(atomicUpdateDocuments,500);
         indexAddMeter.mark(atomicUpdateDocuments.size());
       } catch (Exception e) {
         retrySolrAddsIndividually(atomicUpdateDocuments);
@@ -359,7 +365,8 @@ public class FusionDocumentWriter {
         solrProxy.add(nextDoc);
         indexAddMeter.mark();
       } catch (Exception e) {
-        log.error("Failed to index atomic update document ["+nextDoc.get("id")+"] due to: " + e + "; doc: " + nextDoc);
+        log.error("Failed to index atomic update document ["+nextDoc.get("id")+"] due to: " + e + "; doc: " + nextDoc +
+                  "solrProxy:[" + solrProxy.toString() + "]");
         // shs: Not sure if this should remain "documentAddErrorMeter" instead of being changed to solrAddErrorMeter.
         //      For now, I will leave it as a solrAddErrorMeter.
         solrAddErrorMeter.mark();
