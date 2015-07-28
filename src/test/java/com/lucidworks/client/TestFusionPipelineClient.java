@@ -10,6 +10,10 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 
@@ -121,6 +125,7 @@ public class TestFusionPipelineClient {
       " wireMockRulePort=" + wireMockRulePort + " useWireMockRule=" + useWireMockRule);
 
     String badPath = "/api/apollo/index-pipelines/scottsCollection-default/collections/badCollection/index";
+    String unauthPath = "/api/apollo/index-pipelines/scottsCollection-default/collections/unauthCollection/index";
     if (useWireMockRule) {
       // mock out the Pipeline API
       //  stubFor(post(urlEqualTo("/api/apollo/index-pipelines")).willReturn(aResponse().withStatus(200)));
@@ -129,18 +134,52 @@ public class TestFusionPipelineClient {
       // a bad node in the mix ... to test FusionPipelineClient error handling
       stubFor(post(urlEqualTo(badPath)).willReturn(aResponse().withStatus(500)));
 
+      // another bad node in the mix which produces un-authorized errors... to test FusionPipelineClient error handling
+      stubFor(post(urlEqualTo(unauthPath)).willReturn(aResponse().withStatus(401)));
+
       // mock out the Session API
       stubFor(post(urlEqualTo("/api/session?realmName=" + fusionRealm)).willReturn(aResponse().withStatus(200)));
     }
 
-    String fusionEndpoints = fusionUrl+",http://localhost:"+wireMockRulePort+"/not_and_endpoint/api,http://localhost:"+wireMockRulePort+badPath;
+    String fusionEndpoints =
+      fusionUrl+
+        ",http://localhost:"+wireMockRulePort+"/not_and_endpoint/api" +
+        ",http://localhost:"+wireMockRulePort+badPath+
+        ",http://localhost:"+wireMockRulePort+unauthPath;
 
-    FusionPipelineClient pipelineClient =
+    final FusionPipelineClient pipelineClient =
       new FusionPipelineClient(fusionEndpoints, fusionUser, fusionPass, fusionRealm);
 
-    for (int i=0; i < 10; i++) {
-      pipelineClient.postBatchToPipeline(buildDocs(1));
+    int numThreads = 3;
+    ExecutorService pool = Executors.newFixedThreadPool(numThreads);
+    for (int t=0; t < numThreads; t++) {
+      pool.submit(new Callable<Object>() {
+        @Override
+        public Object call() throws Exception {
+          for (int i = 0; i < 10; i++) {
+            pipelineClient.postBatchToPipeline(buildDocs(1));
+          }
+          return null;
+        }
+      });
     }
+
+    pool.shutdown(); // Disable new tasks from being submitted
+    try {
+      // Wait a while for existing tasks to terminate
+      if (!pool.awaitTermination(30, TimeUnit.SECONDS)) {
+        pool.shutdownNow(); // Cancel currently executing tasks
+        // Wait a while for tasks to respond to being cancelled
+        if (!pool.awaitTermination(30, TimeUnit.SECONDS))
+          System.err.println("Pool did not terminate");
+      }
+    } catch (InterruptedException ie) {
+      // (Re-)Cancel if current thread also interrupted
+      pool.shutdownNow();
+      // Preserve interrupt status
+      Thread.currentThread().interrupt();
+    }
+
   }
 
   protected List<Map<String,Object>> buildDocs(int numDocs) {
