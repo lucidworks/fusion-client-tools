@@ -57,6 +57,16 @@ public class FusionPipelineClient {
   static class ClientAndContext {
     CloseableHttpClient httpClient;
     HttpClientContext context;
+    AtomicInteger refCounter = new AtomicInteger(0);
+
+    synchronized CloseableHttpClient getClient() {
+      refCounter.incrementAndGet();
+      return httpClient;
+    }
+
+    synchronized void releaseClient() {
+      refCounter.decrementAndGet();
+    }
   }
 
   static Map<String,ClientAndContext> establishSession(List<String> endpoints, String user, String password, String realm) throws Exception {
@@ -132,7 +142,10 @@ public class FusionPipelineClient {
   }
 
   Map<String,ClientAndContext> httpClients;
-  long sessionTimeoutAt = -1;
+
+  List<ClientAndContext> needToBeClosed = new ArrayList<ClientAndContext>();
+
+  long sessionEstablishedAt = -1;
   ArrayList<String> endPoints;
   int numEndpoints;
   Random random;
@@ -141,6 +154,10 @@ public class FusionPipelineClient {
   String fusionPass = null;
   String fusionRealm = null;
   AtomicInteger requestCounter = null;
+  long maxNanosOfInactivity;
+  long lastCleanup;
+
+  static long nanosInMinute = TimeUnit.NANOSECONDS.convert(1, TimeUnit.MINUTES);
 
   public FusionPipelineClient(String endpointUrl, String fusionUser, String fusionPass, String fusionRealm) throws MalformedURLException {
 
@@ -148,9 +165,12 @@ public class FusionPipelineClient {
     this.fusionPass = fusionPass;
     this.fusionRealm = fusionRealm;
 
+    maxNanosOfInactivity = TimeUnit.NANOSECONDS.convert(599, TimeUnit.SECONDS);
+    lastCleanup = System.nanoTime();
+
     this.endPoints = new ArrayList<String>();
     this.endPoints.addAll(Arrays.asList(endpointUrl.split(",")));
-    
+
     try {
       resetSession();
     } catch (Exception exc) {
@@ -169,13 +189,14 @@ public class FusionPipelineClient {
   }
 
   protected synchronized void resetSession() throws Exception {
-    closeClients();
+    closeClients(false);
+
     httpClients = establishSession(endPoints, fusionUser, fusionPass, fusionRealm);
-    endPoints = new ArrayList<String>();
-    endPoints.addAll(httpClients.keySet());
     // session timeout in 10 minutes (10 * 60 seconds) ...
     // so we'll do 9 minutes and 59 seconds in case clocks aren't in-sync
-    sessionTimeoutAt = System.nanoTime() + TimeUnit.NANOSECONDS.convert(599, TimeUnit.SECONDS);
+    sessionEstablishedAt = System.nanoTime();
+    endPoints = new ArrayList<String>();
+    endPoints.addAll(httpClients.keySet());
   }
 
   public synchronized HttpClient getHttpClient() {
@@ -193,19 +214,46 @@ public class FusionPipelineClient {
     return list.get((num > 1) ? random.nextInt(num) : 0);
   }
 
-  protected synchronized void closeClients() {
-
-    if (httpClients == null || httpClients.isEmpty())
-      return;
-
-    for (ClientAndContext cnc : httpClients.values()) {
-      try {
-        cnc.httpClient.close();
-      } catch (IOException e) {
-        log.warn("Failed to close httpClient object due to: "+e);
+  protected synchronized void internalHousekeeping(boolean forceClose) {
+    lastCleanup = System.nanoTime();
+    
+    Iterator<ClientAndContext> toCloseIter = needToBeClosed.iterator();
+    while (toCloseIter.hasNext()) {
+      ClientAndContext cnc = toCloseIter.next();
+      if (forceClose || cnc.refCounter.intValue() <= 0) {
+        try {
+          cnc.httpClient.close();
+        } catch (IOException e) {
+          log.warn("Failed to close httpClient object due to: " + e);
+        } finally {
+          toCloseIter.remove(); // closed, so remove from list
+        }
       }
     }
-    httpClients.clear();
+  }
+
+  protected synchronized void closeClients(boolean forceClose) {
+
+    internalHousekeeping(forceClose);
+
+    if (httpClients != null) {
+      for (ClientAndContext cnc : httpClients.values()) {
+        if (forceClose || cnc.refCounter.intValue() <= 0) {
+          try {
+            cnc.httpClient.close();
+          } catch (IOException e) {
+            log.warn("Failed to close httpClient object due to: " + e);
+          }
+        } else {
+          needToBeClosed.add(cnc);
+        }
+      }
+      httpClients.clear(); // always clear this ... leftovers are in the needToBeClosed list
+    }
+
+    if (forceClose) {
+      needToBeClosed.clear();
+    }
   }
 
   public void postBatchToPipeline(List docs) throws Exception {
@@ -216,10 +264,17 @@ public class FusionPipelineClient {
     ArrayList<String> mutable = null;
 
     synchronized (this) {
-      if (System.nanoTime() > sessionTimeoutAt) {
+      // ensure last request within the session timeout period, else reset the session
+      long currTime = System.nanoTime();
+      if ((currTime - sessionEstablishedAt) > maxNanosOfInactivity) {
         log.info("Fusion session is likely expired (or soon will be), " +
           "pre-emptively re-setting all sessions before processing request "+requestId);
         resetSession();
+      }
+
+      // internal housekeeping
+      if (currTime - lastCleanup > nanosInMinute) {
+        internalHousekeeping(false);
       }
 
       mutable = (ArrayList<String>)endPoints.clone();
@@ -340,12 +395,13 @@ public class FusionPipelineClient {
       }
     }
 
-    CloseableHttpClient httpClient = cnc.httpClient;
-    HttpPost postRequest = new HttpPost(endpoint);
-    postRequest.setEntity(new StringEntity(jsonBatch, ContentType.create("application/json", StandardCharsets.UTF_8)));
-    HttpResponse response = httpClient.execute(postRequest, cnc.context);
-    HttpEntity entity = response.getEntity();
+    HttpEntity entity = null;
+    CloseableHttpClient httpClient = cnc.getClient();
     try {
+      HttpPost postRequest = new HttpPost(endpoint);
+      postRequest.setEntity(new StringEntity(jsonBatch, ContentType.create("application/json", StandardCharsets.UTF_8)));
+      HttpResponse response = httpClient.execute(postRequest, cnc.context);
+      entity = response.getEntity();
       int statusCode = response.getStatusLine().getStatusCode();
       if (statusCode == 401) {
         // unauth'd - session probably expired? retry to establish
@@ -361,7 +417,9 @@ public class FusionPipelineClient {
           entity = null;
         }
 
-        synchronized(this) {
+        cnc.releaseClient();
+
+        synchronized (this) {
           resetSession();
           cnc = httpClients.get(endpoint);
           if (cnc == null)
@@ -370,7 +428,7 @@ public class FusionPipelineClient {
         }
 
         log.info("Going to re-try request "+requestId+" after session re-established with "+endpoint);
-        httpClient = cnc.httpClient;
+        httpClient = cnc.getClient();
         response = httpClient.execute(postRequest, cnc.context);
         entity = response.getEntity();
         statusCode = response.getStatusLine().getStatusCode();
@@ -383,8 +441,18 @@ public class FusionPipelineClient {
         raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
       }
     } finally {
-      if (entity != null)
-        EntityUtils.consume(entity);
+
+      cnc.releaseClient();
+
+      if (entity != null) {
+        try {
+          EntityUtils.consume(entity);
+        } catch (Exception ignore) {
+          log.warn("Failed to consume entity due to: "+ignore);
+        } finally {
+          entity = null;
+        }
+      }
     }
   }
 
@@ -419,7 +487,7 @@ public class FusionPipelineClient {
 
   public synchronized void shutdown() {
     if (httpClients != null) {
-      closeClients();
+      closeClients(true);
       httpClients = null;
     }
   }
