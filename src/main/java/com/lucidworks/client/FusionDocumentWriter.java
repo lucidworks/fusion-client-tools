@@ -218,12 +218,18 @@ public class FusionDocumentWriter {
    * @throws Exception
    */
   protected List<Map<String,Object>> toJsonDocs(SolrInputDocument parentSolrDoc, Collection<SolrInputDocument> childSolrDocs, int docCount) throws Exception {
-    log.info("Method:toJsonDocs - Processing SolrInputDocuments: parent:["+ (parentSolrDoc==null ? "null" : parentSolrDoc.toString()) +
-             "] with " + childSolrDocs.size() + " child documents.");
+    boolean isDebugEnabled = log.isDebugEnabled();
+    if (isDebugEnabled) {
+      log.debug("Method:toJsonDocs - Processing SolrInputDocuments: parent:[" + (parentSolrDoc == null ? "null" : parentSolrDoc.toString()) +
+        "] with " + childSolrDocs.size() + " child documents.");
+    }
+    
     List<Map<String,Object>> list = new ArrayList<Map<String,Object>>(childSolrDocs.size());
     for (SolrInputDocument childSolrDoc : childSolrDocs) {
-      log.info("Method:toJsonDocs - Processing SolrInputDocuments: parent:["+ (parentSolrDoc==null ? "null" : parentSolrDoc.toString()) +
-               "]; child:[" + childSolrDoc.toString() + "]");
+      if (isDebugEnabled) {
+        log.debug("Method:toJsonDocs - Processing SolrInputDocuments: parent:[" + (parentSolrDoc == null ? "null" : parentSolrDoc.toString()) +
+          "]; child:[" + childSolrDoc.toString() + "]");
+      }
       list.addAll(toJson(parentSolrDoc, childSolrDoc, docCount));
     }
     return list;
@@ -284,7 +290,8 @@ public class FusionDocumentWriter {
 
       List fields = new ArrayList();
       if (parent != null) {
-        log.info("Method:doc2json - Merging parent and child docs, parent:[" + parent.toString() +
+        if (log.isDebugEnabled())
+          log.debug("Method:doc2json - Merging parent and child docs, parent:[" + parent.toString() +
                 "]; child[" + child.toString() + "].");
 
         // have a parent doc ... flatten by adding all parent doc fields to the child with prefix _p_
