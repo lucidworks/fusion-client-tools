@@ -157,12 +157,19 @@ public class TestFusionPipelineClient {
         @Override
         public Object call() throws Exception {
           for (int i = 0; i < 10; i++) {
-            pipelineClient.postBatchToPipeline(buildDocs(1));
+            try {
+              pipelineClient.postBatchToPipeline(buildDocs(1));
+            } catch (Exception exc) {
+              log.error("\n\nFailed to postBatch due to: " + exc+"\n\n");
+              throw new RuntimeException(exc);
+            }
           }
           return null;
         }
       });
     }
+
+    Thread.sleep(2000);
 
     pool.shutdown(); // Disable new tasks from being submitted
     try {

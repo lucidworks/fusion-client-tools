@@ -54,72 +54,68 @@ public class FusionPipelineClient {
   }
 
   // holds a context and a client object
-  static class ClientAndContext {
-    CloseableHttpClient httpClient;
+  static class FusionSession {
     HttpClientContext context;
-    AtomicInteger refCounter = new AtomicInteger(0);
-
-    synchronized CloseableHttpClient getClient() {
-      refCounter.incrementAndGet();
-      return httpClient;
-    }
-
-    synchronized void releaseClient() {
-      refCounter.decrementAndGet();
-    }
+    long sessionEstablishedAt = -1;
   }
 
-  static Map<String,ClientAndContext> establishSession(List<String> endpoints, String user, String password, String realm) throws Exception {
+  RequestConfig globalConfig;
+  CookieStore cookieStore;
+  CloseableHttpClient httpClient;
 
-    ClientAndContext cnc = new ClientAndContext();
-    cnc.context = HttpClientContext.create();
+  Map<String,FusionSession> sessions;
+  Random random;
+  ObjectMapper jsonObjectMapper;
+  String fusionUser = null;
+  String fusionPass = null;
+  String fusionRealm = null;
+  AtomicInteger requestCounter = null;
 
-    RequestConfig globalConfig = RequestConfig.custom().setCookieSpec(CookieSpecs.BEST_MATCH).build();
-    CookieStore cookieStore = new BasicCookieStore();
-    cnc.context.setCookieStore(cookieStore);
+  static long maxNanosOfInactivity = TimeUnit.NANOSECONDS.convert(599, TimeUnit.SECONDS);
+
+  public FusionPipelineClient(String endpointUrl, String fusionUser, String fusionPass, String fusionRealm) throws MalformedURLException {
+
+    globalConfig = RequestConfig.custom().setCookieSpec(CookieSpecs.BEST_MATCH).build();
+    cookieStore = new BasicCookieStore();
+
+    this.fusionUser = fusionUser;
+    this.fusionPass = fusionPass;
+    this.fusionRealm = fusionRealm;
+
+    // build the HttpClient to be used for all requests
+    HttpClientBuilder httpClientBuilder = HttpClientBuilder.create();
+    httpClientBuilder.setDefaultRequestConfig(globalConfig).setDefaultCookieStore(cookieStore);
+
+    if (fusionUser != null && fusionRealm == null)
+      httpClientBuilder.addInterceptorFirst(new PreEmptiveBasicAuthenticator(fusionUser, fusionPass));
+
+    httpClient = httpClientBuilder.build();
+    HttpClientUtil.setMaxConnections(httpClient, 500);
+    HttpClientUtil.setMaxConnectionsPerHost(httpClient, 100);
+
+    try {
+      sessions = establishSessions(Arrays.asList(endpointUrl.split(",")), fusionUser, fusionPass, fusionRealm);
+    } catch (Exception exc) {
+      if (exc instanceof RuntimeException) {
+        throw (RuntimeException)exc;
+      } else {
+        throw new RuntimeException(exc);
+      }
+    }
+
+    random = new Random();
+    jsonObjectMapper = new ObjectMapper();
+
+    requestCounter = new AtomicInteger(0);
+  }
+
+  protected Map<String,FusionSession> establishSessions(List<String> endpoints, String user, String password, String realm) throws Exception {
 
     Exception lastError = null;
-    Map<String,ClientAndContext> map = new HashMap<String, ClientAndContext>();
+    Map<String,FusionSession> map = new HashMap<String, FusionSession>();
     for (String url : endpoints) {
-
       try {
-        HttpClientBuilder httpClientBuilder = HttpClientBuilder.create();
-        httpClientBuilder.setDefaultRequestConfig(globalConfig).setDefaultCookieStore(cookieStore);
-
-        if (user != null && realm == null) {
-          httpClientBuilder.addInterceptorFirst(new PreEmptiveBasicAuthenticator(user, password));
-        }
-
-        CloseableHttpClient httpClient = httpClientBuilder.build();
-        HttpClientUtil.setMaxConnections(httpClient, 500);
-        HttpClientUtil.setMaxConnectionsPerHost(httpClient, 100);
-
-        if (realm != null) {
-          int at = url.indexOf("/api");
-          String proxyUrl = url.substring(0, at);
-          String sessionApi = proxyUrl + "/api/session?realmName=" + realm;
-          String jsonString = "{\"username\":\"" + user + "\", \"password\":\"" + password + "\"}"; // TODO: ugly!
-          HttpPost postRequest = new HttpPost(sessionApi);
-          postRequest.setEntity(new StringEntity(jsonString, ContentType.create("application/json", StandardCharsets.UTF_8)));
-          HttpResponse response = httpClient.execute(postRequest, cnc.context);
-          HttpEntity entity = response.getEntity();
-          try {
-            int statusCode = response.getStatusLine().getStatusCode();
-            if (statusCode != 200 && statusCode != 201 && statusCode != 204) {
-              String body = extractResponseBodyText(entity);
-              throw new SolrException(SolrException.ErrorCode.getErrorCode(statusCode),
-                "POST credentials to Fusion Session API [" + sessionApi + "] failed due to: " +
-                  response.getStatusLine() + ": " + body);
-            }
-          } finally {
-            if (entity != null)
-              EntityUtils.consume(entity);
-          }
-          log.info("Established secure session with Fusion Session API on " + proxyUrl+" for user "+user+" in realm "+realm);
-        }
-
-        cnc.httpClient = httpClient;
-        map.put(url, cnc);
+        map.put(url, establishSession(url, user, password, realm));
       } catch (Exception exc) {
         // just log this ... so long as there is at least one good endpoint we can use it
         lastError = exc;
@@ -141,69 +137,58 @@ public class FusionPipelineClient {
     return map;
   }
 
-  Map<String,ClientAndContext> httpClients;
+  protected FusionSession establishSession(String url, String user, String password, String realm) throws Exception {
 
-  List<ClientAndContext> needToBeClosed = new ArrayList<ClientAndContext>();
+    FusionSession fusionSession = new FusionSession();
 
-  long sessionEstablishedAt = -1;
-  ArrayList<String> endPoints;
-  int numEndpoints;
-  Random random;
-  ObjectMapper jsonObjectMapper;
-  String fusionUser = null;
-  String fusionPass = null;
-  String fusionRealm = null;
-  AtomicInteger requestCounter = null;
-  long maxNanosOfInactivity;
-  long lastCleanup;
+    fusionSession.context = HttpClientContext.create();
+    fusionSession.context.setCookieStore(cookieStore);
 
-  static long nanosInMinute = TimeUnit.NANOSECONDS.convert(1, TimeUnit.MINUTES);
-
-  public FusionPipelineClient(String endpointUrl, String fusionUser, String fusionPass, String fusionRealm) throws MalformedURLException {
-
-    this.fusionUser = fusionUser;
-    this.fusionPass = fusionPass;
-    this.fusionRealm = fusionRealm;
-
-    maxNanosOfInactivity = TimeUnit.NANOSECONDS.convert(599, TimeUnit.SECONDS);
-    lastCleanup = System.nanoTime();
-
-    this.endPoints = new ArrayList<String>();
-    this.endPoints.addAll(Arrays.asList(endpointUrl.split(",")));
-
-    try {
-      resetSession();
-    } catch (Exception exc) {
-      if (exc instanceof RuntimeException) {
-        throw (RuntimeException)exc;
-      } else {
-        throw new RuntimeException(exc);
+    if (realm != null) {
+      int at = url.indexOf("/api");
+      String proxyUrl = url.substring(0, at);
+      String sessionApi = proxyUrl + "/api/session?realmName=" + realm;
+      String jsonString = "{\"username\":\"" + user + "\", \"password\":\"" + password + "\"}"; // TODO: ugly!
+      HttpPost postRequest = new HttpPost(sessionApi);
+      postRequest.setEntity(new StringEntity(jsonString, ContentType.create("application/json", StandardCharsets.UTF_8)));
+      HttpResponse response = httpClient.execute(postRequest, fusionSession.context);
+      HttpEntity entity = response.getEntity();
+      try {
+        int statusCode = response.getStatusLine().getStatusCode();
+        if (statusCode != 200 && statusCode != 201 && statusCode != 204) {
+          String body = extractResponseBodyText(entity);
+          throw new SolrException(SolrException.ErrorCode.getErrorCode(statusCode),
+            "POST credentials to Fusion Session API [" + sessionApi + "] failed due to: " +
+              response.getStatusLine() + ": " + body);
+        }
+      } finally {
+        if (entity != null)
+          EntityUtils.consume(entity);
       }
+      log.info("Established secure session with Fusion Session API on " + url + " for user "+user+" in realm "+realm);
     }
 
-    random = new Random();
-    numEndpoints = endPoints.size();
-    jsonObjectMapper = new ObjectMapper();
+    fusionSession.sessionEstablishedAt = System.nanoTime();
 
-    this.requestCounter = new AtomicInteger(0);
+    return fusionSession;
   }
 
-  protected synchronized void resetSession() throws Exception {
-    closeClients(false);
-
-    httpClients = establishSession(endPoints, fusionUser, fusionPass, fusionRealm);
-    // session timeout in 10 minutes (10 * 60 seconds) ...
-    // so we'll do 9 minutes and 59 seconds in case clocks aren't in-sync
-    sessionEstablishedAt = System.nanoTime();
-    endPoints = new ArrayList<String>();
-    endPoints.addAll(httpClients.keySet());
+  protected synchronized FusionSession resetSession(String endpoint) throws Exception {
+    // reset the "context" object for the HttpContext for this endpoint
+    FusionSession fusionSession = null;
+    try {
+      fusionSession = establishSession(endpoint, fusionUser, fusionPass, fusionRealm);
+      sessions.put(endpoint, fusionSession);
+    } catch (Exception exc) {
+      log.error("Failed to re-establish session with Fusion at " + endpoint + " due to: " + exc);
+      sessions.remove(endpoint);
+      fusionSession = null;
+    }
+    return fusionSession;
   }
-
-  public synchronized HttpClient getHttpClient() {
-    if (httpClients.isEmpty())
-      return null;
-
-    return httpClients.values().iterator().next().httpClient;
+  
+  public HttpClient getHttpClient() {
+    return httpClient;
   }
 
   protected String getLbEndpoint(List<String> list) {
@@ -213,78 +198,26 @@ public class FusionPipelineClient {
 
     return list.get((num > 1) ? random.nextInt(num) : 0);
   }
-
-  protected synchronized void internalHousekeeping(boolean forceClose) {
-    lastCleanup = System.nanoTime();
-    
-    Iterator<ClientAndContext> toCloseIter = needToBeClosed.iterator();
-    while (toCloseIter.hasNext()) {
-      ClientAndContext cnc = toCloseIter.next();
-      if (forceClose || cnc.refCounter.intValue() <= 0) {
-        try {
-          cnc.httpClient.close();
-        } catch (IOException e) {
-          log.warn("Failed to close httpClient object due to: " + e);
-        } finally {
-          toCloseIter.remove(); // closed, so remove from list
-        }
-      }
-    }
-  }
-
-  protected synchronized void closeClients(boolean forceClose) {
-
-    internalHousekeeping(forceClose);
-
-    if (httpClients != null) {
-      for (ClientAndContext cnc : httpClients.values()) {
-        if (forceClose || cnc.refCounter.intValue() <= 0) {
-          try {
-            cnc.httpClient.close();
-          } catch (IOException e) {
-            log.warn("Failed to close httpClient object due to: " + e);
-          }
-        } else {
-          needToBeClosed.add(cnc);
-        }
-      }
-      httpClients.clear(); // always clear this ... leftovers are in the needToBeClosed list
-    }
-
-    if (forceClose) {
-      needToBeClosed.clear();
-    }
-  }
-
+  
   public void postBatchToPipeline(List docs) throws Exception {
     int numDocs = docs.size();
     String jsonBody = jsonObjectMapper.writeValueAsString(docs);
 
     int requestId = requestCounter.incrementAndGet();
     ArrayList<String> mutable = null;
-
     synchronized (this) {
-      // ensure last request within the session timeout period, else reset the session
-      long currTime = System.nanoTime();
-      if ((currTime - sessionEstablishedAt) > maxNanosOfInactivity) {
-        log.info("Fusion session is likely expired (or soon will be), " +
-          "pre-emptively re-setting all sessions before processing request "+requestId);
-        resetSession();
-      }
-
-      // internal housekeeping
-      if (currTime - lastCleanup > nanosInMinute) {
-        internalHousekeeping(false);
-      }
-
-      mutable = (ArrayList<String>)endPoints.clone();
+      mutable = new ArrayList<String>(sessions.keySet());
     }
 
-    if (numEndpoints > 1) {
+    if (mutable.isEmpty())
+      throw new IllegalStateException("No available endpoints! " +
+        "Check log for previous errors as to why there are no more endpoints available. This is a fatal error.");
+
+    if (mutable.size() > 1) {
       Exception lastExc = null;
 
-      // try all the endpoints until success is reached
-      for (int e=0; e < numEndpoints; e++) {
+      // try all the endpoints until success is reached ... or we run out of endpoints to try ...
+      while (!mutable.isEmpty()) {
         String endpoint = getLbEndpoint(mutable);
         if (endpoint == null) {
           // no more endpoints available ... fail
@@ -301,7 +234,7 @@ public class FusionPipelineClient {
           log.debug("POSTing batch of "+numDocs+" input docs to "+endpoint+" as request "+requestId);
 
         Exception retryAfterException =
-          postJsonToPipelineWithRetry(e, endpoint, jsonBody, mutable, lastExc, requestId);
+          postJsonToPipelineWithRetry(endpoint, jsonBody, mutable, lastExc, requestId);
         if (retryAfterException == null) {
           lastExc = null;
           break; // request succeeded ...
@@ -321,36 +254,32 @@ public class FusionPipelineClient {
       if (log.isDebugEnabled())
         log.debug("POSTing batch of "+numDocs+" input docs to "+endpoint+" as request "+requestId);
 
-      Exception exc = postJsonToPipelineWithRetry(0, endpoint, jsonBody, mutable, null, requestId);
+      Exception exc = postJsonToPipelineWithRetry(endpoint, jsonBody, mutable, null, requestId);
       if (exc != null)
         throw exc;
     }
   }
 
-  protected Exception postJsonToPipelineWithRetry(int e, String endpoint, String jsonBody,
+  protected Exception postJsonToPipelineWithRetry(String endpoint, String jsonBody,
         ArrayList<String> mutable, Exception lastExc, int requestId)
     throws Exception
   {
     Exception retryAfterException = null;
 
     try {
-
       postJsonToPipeline(endpoint, jsonBody, requestId);
       if (lastExc != null)
         log.info("Re-try request "+requestId+" to "+endpoint+" succeeded after seeing a "+lastExc.getMessage());
-
     } catch (Exception exc) {
       log.error("Failed to send request "+requestId+" to '"+endpoint+"' due to: "+exc);
-      // if there is another endpoint to try ...
-      if (e+1 < numEndpoints) {
+      if (mutable.size() > 1) {
         // try another endpoint but update the cloned list to avoid re-hitting the one having an error
         log.info("Will re-try failed request "+requestId+" on next endpoint in the list");
         mutable.remove(endpoint);
         retryAfterException = exc;
       } else {
         // no other endpoints to try ... brief wait and then retry
-        log.info("No more endpoints available to try ... will retry to send request "+
-          requestId+" to "+endpoint+" after waiting 1 sec");
+        log.info("No more endpoints available to try ... will retry to send request "+ requestId+" to "+endpoint+" after waiting 1 sec");
         try {
           Thread.sleep(1000);
         } catch (InterruptedException ignore) {
@@ -375,38 +304,34 @@ public class FusionPipelineClient {
 
   public void postJsonToPipeline(String endpoint, String jsonBatch, int requestId) throws Exception {
 
-    ClientAndContext cnc = null;
+    FusionSession fusionSession = null;
 
+    long currTime = System.nanoTime();
     synchronized (this) {
-      cnc = httpClients.get(endpoint);
-      if (cnc == null) {
-        // no context for endpoint ... re-establish
-        log.warn("No existing Http client available for "+endpoint+
-          "! Re-establishing session before re-trying request "+requestId+" ...");
-        Map<String,ClientAndContext> map =
-          establishSession(Arrays.asList(endpoint), fusionUser, fusionPass, fusionRealm);
-        cnc = map.get(endpoint);
+      fusionSession = sessions.get(endpoint);
 
-        if (cnc == null)
+      // ensure last request within the session timeout period, else reset the session
+      if (fusionSession == null || (currTime - fusionSession.sessionEstablishedAt) > maxNanosOfInactivity) {
+        log.info("Fusion session is likely expired (or soon will be) for endpoint "+endpoint+", " +
+          "pre-emptively re-setting this session before processing request "+requestId);
+        fusionSession = resetSession(endpoint);
+        if (fusionSession == null)
           throw new IllegalStateException("Failed to re-connect to "+endpoint+
             " after session loss when processing request "+requestId);
-
-        httpClients.put(endpoint, cnc);
       }
     }
 
     HttpEntity entity = null;
-    CloseableHttpClient httpClient = cnc.getClient();
     try {
       HttpPost postRequest = new HttpPost(endpoint);
       postRequest.setEntity(new StringEntity(jsonBatch, ContentType.create("application/json", StandardCharsets.UTF_8)));
-      HttpResponse response = httpClient.execute(postRequest, cnc.context);
+      HttpResponse response = httpClient.execute(postRequest, fusionSession.context);
       entity = response.getEntity();
       int statusCode = response.getStatusLine().getStatusCode();
       if (statusCode == 401) {
         // unauth'd - session probably expired? retry to establish
         log.error("Unauthorized error (401) when trying to send request "+requestId+
-          " to Fusion, will re-try to establish session");
+          " to Fusion at "+endpoint+", will re-try to establish session");
 
         // re-establish the session and re-try the request
         try {
@@ -417,19 +342,15 @@ public class FusionPipelineClient {
           entity = null;
         }
 
-        cnc.releaseClient();
-
         synchronized (this) {
-          resetSession();
-          cnc = httpClients.get(endpoint);
-          if (cnc == null)
+          fusionSession = resetSession(endpoint);
+          if (fusionSession == null)
             throw new IllegalStateException("After re-establishing session when processing request "+
               requestId+", endpoint "+endpoint+" is no longer active! Try another endpoint.");
         }
 
         log.info("Going to re-try request "+requestId+" after session re-established with "+endpoint);
-        httpClient = cnc.getClient();
-        response = httpClient.execute(postRequest, cnc.context);
+        response = httpClient.execute(postRequest, fusionSession.context);
         entity = response.getEntity();
         statusCode = response.getStatusLine().getStatusCode();
         if (statusCode == 200 || statusCode == 204) {
@@ -441,8 +362,6 @@ public class FusionPipelineClient {
         raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
       }
     } finally {
-
-      cnc.releaseClient();
 
       if (entity != null) {
         try {
@@ -486,9 +405,21 @@ public class FusionPipelineClient {
   }
 
   public synchronized void shutdown() {
-    if (httpClients != null) {
-      closeClients(true);
-      httpClients = null;
+    if (sessions != null) {
+      sessions.clear();
+      sessions = null;
+    }
+
+    if (httpClient != null) {
+      try {
+        httpClient.close();
+      } catch (IOException e) {
+        log.warn("Failed to close httpClient object due to: " + e);
+      } finally {
+        httpClient = null;
+      }
+    } else {
+      log.error("Already shutdown.");
     }
   }
 }
