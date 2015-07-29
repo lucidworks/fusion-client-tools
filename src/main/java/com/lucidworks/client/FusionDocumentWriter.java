@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit;
  */
 public class FusionDocumentWriter {
 
-  private static final Log log = LogFactory.getLog(FusionPipelineClient.class);
+  private static final Log log = LogFactory.getLog(FusionDocumentWriter.class);
 
   public static MetricName metricName(Class<?> producerClass, String metric, String indexerName) {
     return new MetricName("hbaseindexer", producerClass.getSimpleName(), metric, indexerName);
@@ -290,7 +290,7 @@ public class FusionDocumentWriter {
         // have a parent doc ... flatten by adding all parent doc fields to the child with prefix _p_
         for (String f : parent.getFieldNames()) {
           if ("id".equals(f)) {
-            fields.add(mapField("_p_id_s", null /* field name prefix */, parent.getField("id").getFirstValue()));
+            fields.add(mapField("_p_id", null /* field name prefix */, parent.getField("id").getFirstValue()));
           } else {
             appendField(parent, f, "_p_", fields);
           }
