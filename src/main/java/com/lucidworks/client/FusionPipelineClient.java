@@ -61,6 +61,7 @@ public class FusionPipelineClient {
     long sessionEstablishedAt = -1;
   }
 
+  List<String> originalEndpoints;
   RequestConfig globalConfig;
   CookieStore cookieStore;
   CloseableHttpClient httpClient;
@@ -95,8 +96,9 @@ public class FusionPipelineClient {
     HttpClientUtil.setMaxConnections(httpClient, 500);
     HttpClientUtil.setMaxConnectionsPerHost(httpClient, 100);
 
+    originalEndpoints = Arrays.asList(endpointUrl.split(","));
     try {
-      sessions = establishSessions(Arrays.asList(endpointUrl.split(",")), fusionUser, fusionPass, fusionRealm);
+      sessions = establishSessions(originalEndpoints, fusionUser, fusionPass, fusionRealm);
     } catch (Exception exc) {
       if (exc instanceof RuntimeException) {
         throw (RuntimeException)exc;
@@ -121,7 +123,7 @@ public class FusionPipelineClient {
       } catch (Exception exc) {
         // just log this ... so long as there is at least one good endpoint we can use it
         lastError = exc;
-        log.error("Failed to establish session with Fusion at "+url+" due to: "+exc);
+        log.warn("Failed to establish session with Fusion at " + url+" due to: "+exc);
       }
     }
 
@@ -231,7 +233,6 @@ public class FusionPipelineClient {
       httpCookie.setPath(sessionCookie.getPath());
       httpCookie.setDomain(sessionCookie.getDomain());
       cookieStore.addCookie(httpCookie);
-      log.info("Reset Fusion session cookie for "+sessionCookie.getDomain());
     }
 
     cookieStore.clearExpired(new Date()); // this should clear the cookie
@@ -273,9 +274,22 @@ public class FusionPipelineClient {
       mutable = new ArrayList<String>(sessions.keySet());
     }
 
-    if (mutable.isEmpty())
-      throw new IllegalStateException("No available endpoints! " +
-        "Check log for previous errors as to why there are no more endpoints available. This is a fatal error.");
+    if (mutable.isEmpty()) {
+      // completely hosed ... try to re-establish all sessions
+      synchronized (this) {
+        try {
+          Thread.sleep(2000);
+        } catch (InterruptedException ie) {
+          Thread.interrupted();
+        }
+        
+        sessions = establishSessions(originalEndpoints, fusionUser, fusionPass, fusionRealm);
+        mutable = new ArrayList<String>(sessions.keySet());
+      }
+      if (mutable.isEmpty())
+        throw new IllegalStateException("No available endpoints! " +
+          "Check log for previous errors as to why there are no more endpoints available. This is a fatal error.");
+    }
 
     if (mutable.size() > 1) {
       Exception lastExc = null;
@@ -335,15 +349,17 @@ public class FusionPipelineClient {
       if (lastExc != null)
         log.info("Re-try request "+requestId+" to "+endpoint+" succeeded after seeing a "+lastExc.getMessage());
     } catch (Exception exc) {
-      log.error("Failed to send request "+requestId+" to '"+endpoint+"' due to: "+exc);
+      log.warn("Failed to send request "+requestId+" to '"+endpoint+"' due to: "+exc);
       if (mutable.size() > 1) {
         // try another endpoint but update the cloned list to avoid re-hitting the one having an error
-        log.info("Will re-try failed request "+requestId+" on next endpoint in the list");
+        if (log.isDebugEnabled())
+          log.debug("Will re-try failed request " + requestId + " on next endpoint in the list");
+
         mutable.remove(endpoint);
         retryAfterException = exc;
       } else {
         // no other endpoints to try ... brief wait and then retry
-        log.info("No more endpoints available to try ... will retry to send request "+ requestId+" to "+endpoint+" after waiting 1 sec");
+        log.warn("No more endpoints available to try ... will retry to send request "+ requestId+" to "+endpoint+" after waiting 1 sec");
         try {
           Thread.sleep(1000);
         } catch (InterruptedException ignore) {
@@ -351,8 +367,7 @@ public class FusionPipelineClient {
         }
         // note we want the exception to propagate from here up the stack since we re-tried and it didn't work
         postJsonToPipeline(endpoint, jsonBody, requestId);
-        log.info("Re-try request " + requestId + " to " +
-          endpoint + " succeeded after seeing a " + exc + " on the previous attempt");
+        log.info("Re-try request " + requestId + " to " + endpoint + " succeeded");
         retryAfterException = null; // return success condition
       }
     }
@@ -398,8 +413,8 @@ public class FusionPipelineClient {
       int statusCode = response.getStatusLine().getStatusCode();
       if (statusCode == 401) {
         // unauth'd - session probably expired? retry to establish
-        log.error("Unauthorized error (401) when trying to send request "+requestId+
-          " to Fusion at "+endpoint+", will re-try to establish session");
+        log.warn("Unauthorized error (401) when trying to send request " + requestId +
+          " to Fusion at " + endpoint + ", will re-try to establish session");
 
         // re-establish the session and re-try the request
         try {
