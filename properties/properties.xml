@@ -9,7 +9,7 @@
 <entry key="fusionHost">localhost</entry>
 <entry key="fusionApiPort">8764</entry>
 <entry key="fusionCollection">agentCollection</entry>
-<entry key="fusionIndexingPipeline">scottsCollection-default</entry>
+<entry key="fusionIndexingPipeline">agentCollection-default</entry>
 <entry key="fusionProxyBaseUrl">/api/apollo</entry>
 <entry key="fusionIndexingPipelineUrlExtension">/index-pipelines</entry>
 <entry key="fusionUser">admin</entry>

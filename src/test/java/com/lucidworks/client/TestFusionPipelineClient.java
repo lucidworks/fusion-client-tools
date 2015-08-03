@@ -141,11 +141,11 @@ public class TestFusionPipelineClient {
       stubFor(post(urlEqualTo("/api/session?realmName=" + fusionRealm)).willReturn(aResponse().withStatus(200)));
     }
 
-    String fusionEndpoints =
+    String fusionEndpoints = useWireMockRule ?
       fusionUrl+
         ",http://localhost:"+wireMockRulePort+"/not_and_endpoint/api" +
         ",http://localhost:"+wireMockRulePort+badPath+
-        ",http://localhost:"+wireMockRulePort+unauthPath;
+        ",http://localhost:"+wireMockRulePort+unauthPath : fusionUrl;
 
     final FusionPipelineClient pipelineClient =
       new FusionPipelineClient(fusionEndpoints, fusionUser, fusionPass, fusionRealm);
@@ -169,7 +169,28 @@ public class TestFusionPipelineClient {
       });
     }
 
-    Thread.sleep(2000);
+    /*
+    log.info("Sleeping for 10 minutes to let sessions expire");
+    Thread.sleep(602*1000);
+    log.info("Done sleeping for 10 minutes ... resending docs");
+
+    for (int t=0; t < numThreads; t++) {
+      pool.submit(new Callable<Object>() {
+        @Override
+        public Object call() throws Exception {
+          for (int i = 0; i < 10; i++) {
+            try {
+              pipelineClient.postBatchToPipeline(buildDocs(1));
+            } catch (Exception exc) {
+              log.error("\n\nFailed to postBatch due to: " + exc+"\n\n");
+              throw new RuntimeException(exc);
+            }
+          }
+          return null;
+        }
+      });
+    }
+    */
 
     pool.shutdown(); // Disable new tasks from being submitted
     try {

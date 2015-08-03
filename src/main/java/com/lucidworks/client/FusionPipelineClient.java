@@ -11,10 +11,12 @@ import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.client.CookieStore;
 import org.apache.http.client.HttpClient;
 import org.apache.http.client.methods.HttpPost;
+import org.apache.http.cookie.Cookie;
 import org.apache.http.entity.ContentType;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.auth.BasicScheme;
 import org.apache.http.impl.client.*;
+import org.apache.http.impl.cookie.BasicClientCookie;
 import org.apache.http.protocol.HttpContext;
 import org.apache.http.util.EntityUtils;
 import org.apache.solr.client.solrj.impl.HttpClientUtil;
@@ -28,6 +30,7 @@ import org.apache.http.client.protocol.HttpClientContext;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.IOException;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.net.ConnectException;
 import java.net.MalformedURLException;
@@ -55,7 +58,6 @@ public class FusionPipelineClient {
 
   // holds a context and a client object
   static class FusionSession {
-    HttpClientContext context;
     long sessionEstablishedAt = -1;
   }
 
@@ -140,18 +142,28 @@ public class FusionPipelineClient {
   protected FusionSession establishSession(String url, String user, String password, String realm) throws Exception {
 
     FusionSession fusionSession = new FusionSession();
-
-    fusionSession.context = HttpClientContext.create();
-    fusionSession.context.setCookieStore(cookieStore);
-
     if (realm != null) {
       int at = url.indexOf("/api");
       String proxyUrl = url.substring(0, at);
       String sessionApi = proxyUrl + "/api/session?realmName=" + realm;
       String jsonString = "{\"username\":\"" + user + "\", \"password\":\"" + password + "\"}"; // TODO: ugly!
-      HttpPost postRequest = new HttpPost(sessionApi);
+
+      URL sessionApiUrl = new URL(sessionApi);
+      String sessionHost = sessionApiUrl.getHost();
+
+      try {
+        clearCookieForHost(sessionHost);
+      } catch (Exception exc) {
+        log.warn("Failed to clear session cookie for "+sessionHost+" due to: "+exc);
+      }
+
+      HttpPost postRequest = new HttpPost(sessionApiUrl.toURI());
       postRequest.setEntity(new StringEntity(jsonString, ContentType.create("application/json", StandardCharsets.UTF_8)));
-      HttpResponse response = httpClient.execute(postRequest, fusionSession.context);
+
+      HttpClientContext context = HttpClientContext.create();
+      context.setCookieStore(cookieStore);
+
+      HttpResponse response = httpClient.execute(postRequest, context);
       HttpEntity entity = response.getEntity();
       try {
         int statusCode = response.getStatusLine().getStatusCode();
@@ -160,17 +172,69 @@ public class FusionPipelineClient {
           throw new SolrException(SolrException.ErrorCode.getErrorCode(statusCode),
             "POST credentials to Fusion Session API [" + sessionApi + "] failed due to: " +
               response.getStatusLine() + ": " + body);
+        } else if (statusCode == 401) {
+          // retry in case this is an expired error
+          String body = extractResponseBodyText(entity);
+          if (body != null && body.indexOf("session-idle-timeout") != -1) {
+            EntityUtils.consume(entity); // have to consume the previous entity before re-trying the request
+
+            log.warn("Received session-idle-timeout error from Fusion Session API, re-trying to establish a new session to " + url);
+            try {
+              clearCookieForHost(sessionHost);
+            } catch (Exception exc) {
+              log.warn("Failed to clear session cookie for "+sessionHost+" due to: "+exc);
+            }
+
+            response = httpClient.execute(postRequest, context);
+            entity = response.getEntity();
+            statusCode = response.getStatusLine().getStatusCode();
+            if (statusCode != 200 && statusCode != 201 && statusCode != 204) {
+              body = extractResponseBodyText(entity);
+              throw new SolrException(SolrException.ErrorCode.getErrorCode(statusCode),
+                "POST credentials to Fusion Session API [" + sessionApi + "] failed due to: " +
+                  response.getStatusLine() + ": " + body);
+            }
+          }
         }
       } finally {
         if (entity != null)
           EntityUtils.consume(entity);
       }
-      log.info("Established secure session with Fusion Session API on " + url + " for user "+user+" in realm "+realm);
+      log.info("Established secure session with Fusion Session API on " + url + " for user " + user + " in realm " + realm);
     }
 
     fusionSession.sessionEstablishedAt = System.nanoTime();
 
     return fusionSession;
+  }
+
+  protected synchronized void clearCookieForHost(String sessionHost) throws Exception {
+    Cookie sessionCookie = null;
+    for (Cookie cookie : cookieStore.getCookies()) {
+      String cookieDomain = cookie.getDomain();
+      if (cookieDomain != null) {
+        if (sessionHost.equals(cookieDomain) ||
+          sessionHost.indexOf(cookieDomain) != -1 ||
+          cookieDomain.indexOf(sessionHost) != -1)
+        {
+          sessionCookie = cookie;
+          break;
+        }
+      }
+    }
+
+    if (sessionCookie != null) {
+      BasicClientCookie httpCookie =
+        new BasicClientCookie(sessionCookie.getName(),sessionCookie.getValue());
+      httpCookie.setExpiryDate(new Date(0));
+      httpCookie.setVersion(1);
+      httpCookie.setPath(sessionCookie.getPath());
+      httpCookie.setDomain(sessionCookie.getDomain());
+      cookieStore.addCookie(httpCookie);
+      log.info("Reset Fusion session cookie for "+sessionCookie.getDomain());
+    }
+
+    cookieStore.clearExpired(new Date()); // this should clear the cookie
   }
 
   protected synchronized FusionSession resetSession(String endpoint) throws Exception {
@@ -325,7 +389,11 @@ public class FusionPipelineClient {
     try {
       HttpPost postRequest = new HttpPost(endpoint);
       postRequest.setEntity(new StringEntity(jsonBatch, ContentType.create("application/json", StandardCharsets.UTF_8)));
-      HttpResponse response = httpClient.execute(postRequest, fusionSession.context);
+
+      HttpClientContext context = HttpClientContext.create();
+      context.setCookieStore(cookieStore);
+
+      HttpResponse response = httpClient.execute(postRequest, context);
       entity = response.getEntity();
       int statusCode = response.getStatusLine().getStatusCode();
       if (statusCode == 401) {
@@ -350,7 +418,7 @@ public class FusionPipelineClient {
         }
 
         log.info("Going to re-try request "+requestId+" after session re-established with "+endpoint);
-        response = httpClient.execute(postRequest, fusionSession.context);
+        response = httpClient.execute(postRequest, context);
         entity = response.getEntity();
         statusCode = response.getStatusLine().getStatusCode();
         if (statusCode == 200 || statusCode == 204) {

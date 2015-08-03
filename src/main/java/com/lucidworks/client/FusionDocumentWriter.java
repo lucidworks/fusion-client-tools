@@ -223,7 +223,7 @@ public class FusionDocumentWriter {
       log.debug("Method:toJsonDocs - Processing SolrInputDocuments: parent:[" + (parentSolrDoc == null ? "null" : parentSolrDoc.toString()) +
         "] with " + childSolrDocs.size() + " child documents.");
     }
-    
+
     List<Map<String,Object>> list = new ArrayList<Map<String,Object>>(childSolrDocs.size());
     for (SolrInputDocument childSolrDoc : childSolrDocs) {
       if (isDebugEnabled) {
