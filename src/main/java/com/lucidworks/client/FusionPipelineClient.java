@@ -1,5 +1,8 @@
 package com.lucidworks.client;
 
+import com.yammer.metrics.Metrics;
+import com.yammer.metrics.core.Meter;
+import com.yammer.metrics.core.MetricName;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.http.HttpEntity;
@@ -43,6 +46,10 @@ public class FusionPipelineClient {
 
   private static final Log log = LogFactory.getLog(FusionPipelineClient.class);
 
+  private static MetricName metricName(String metric, String endpoint) {
+    return new MetricName("Lucidworks", "FusionPipelineClient", metric, endpoint);
+  }
+
   // for basic auth to the pipeline service
   private static final class PreEmptiveBasicAuthenticator implements HttpRequestInterceptor {
     private final UsernamePasswordCredentials credentials;
@@ -59,6 +66,7 @@ public class FusionPipelineClient {
   // holds a context and a client object
   static class FusionSession {
     long sessionEstablishedAt = -1;
+    Meter docsSentMeter = null;
   }
 
   List<String> originalEndpoints;
@@ -73,6 +81,7 @@ public class FusionPipelineClient {
   String fusionPass = null;
   String fusionRealm = null;
   AtomicInteger requestCounter = null;
+  Map<String,Meter> metersByHost = new HashMap<>();
 
   static long maxNanosOfInactivity = TimeUnit.NANOSECONDS.convert(599, TimeUnit.SECONDS);
 
@@ -113,6 +122,16 @@ public class FusionPipelineClient {
     requestCounter = new AtomicInteger(0);
   }
 
+  protected Meter getMeterByHost(String meterName, String host) {
+    String key = meterName+" ("+host+")";
+    Meter meter =  metersByHost.get(key);
+    if (meter == null) {
+      meter = Metrics.newMeter(metricName(meterName, host), key, TimeUnit.SECONDS);
+      metersByHost.put(key, meter);
+    }
+    return meter;
+  }
+
   protected Map<String,FusionSession> establishSessions(List<String> endpoints, String user, String password, String realm) throws Exception {
 
     Exception lastError = null;
@@ -144,6 +163,7 @@ public class FusionPipelineClient {
   protected FusionSession establishSession(String url, String user, String password, String realm) throws Exception {
 
     FusionSession fusionSession = new FusionSession();
+
     if (realm != null) {
       int at = url.indexOf("/api");
       String proxyUrl = url.substring(0, at);
@@ -206,6 +226,10 @@ public class FusionPipelineClient {
     }
 
     fusionSession.sessionEstablishedAt = System.nanoTime();
+
+    URL fusionUrl = new URL(url);
+    String hostAndPort = fusionUrl.getHost()+":"+fusionUrl.getPort();
+    fusionSession.docsSentMeter = getMeterByHost("Docs Sent to Fusion", hostAndPort);
 
     return fusionSession;
   }
@@ -282,7 +306,7 @@ public class FusionPipelineClient {
         } catch (InterruptedException ie) {
           Thread.interrupted();
         }
-        
+
         sessions = establishSessions(originalEndpoints, fusionUser, fusionPass, fusionRealm);
         mutable = new ArrayList<String>(sessions.keySet());
       }
@@ -312,7 +336,7 @@ public class FusionPipelineClient {
           log.debug("POSTing batch of "+numDocs+" input docs to "+endpoint+" as request "+requestId);
 
         Exception retryAfterException =
-          postJsonToPipelineWithRetry(endpoint, jsonBody, mutable, lastExc, requestId);
+          postJsonToPipelineWithRetry(endpoint, numDocs, jsonBody, mutable, lastExc, requestId);
         if (retryAfterException == null) {
           lastExc = null;
           break; // request succeeded ...
@@ -332,20 +356,20 @@ public class FusionPipelineClient {
       if (log.isDebugEnabled())
         log.debug("POSTing batch of "+numDocs+" input docs to "+endpoint+" as request "+requestId);
 
-      Exception exc = postJsonToPipelineWithRetry(endpoint, jsonBody, mutable, null, requestId);
+      Exception exc = postJsonToPipelineWithRetry(endpoint, numDocs, jsonBody, mutable, null, requestId);
       if (exc != null)
         throw exc;
     }
   }
 
-  protected Exception postJsonToPipelineWithRetry(String endpoint, String jsonBody,
+  protected Exception postJsonToPipelineWithRetry(String endpoint, int numDocsInBatch, String jsonBody,
         ArrayList<String> mutable, Exception lastExc, int requestId)
     throws Exception
   {
     Exception retryAfterException = null;
 
     try {
-      postJsonToPipeline(endpoint, jsonBody, requestId);
+      postJsonToPipeline(endpoint, numDocsInBatch, jsonBody, requestId);
       if (lastExc != null)
         log.info("Re-try request "+requestId+" to "+endpoint+" succeeded after seeing a "+lastExc.getMessage());
     } catch (Exception exc) {
@@ -366,7 +390,7 @@ public class FusionPipelineClient {
           Thread.interrupted();
         }
         // note we want the exception to propagate from here up the stack since we re-tried and it didn't work
-        postJsonToPipeline(endpoint, jsonBody, requestId);
+        postJsonToPipeline(endpoint, numDocsInBatch, jsonBody, requestId);
         log.info("Re-try request " + requestId + " to " + endpoint + " succeeded");
         retryAfterException = null; // return success condition
       }
@@ -381,7 +405,7 @@ public class FusionPipelineClient {
             rootCause instanceof SocketException);
   }
 
-  public void postJsonToPipeline(String endpoint, String jsonBatch, int requestId) throws Exception {
+  public void postJsonToPipeline(String endpoint, int numDocsInBatch, String jsonBatch, int requestId) throws Exception {
 
     FusionSession fusionSession = null;
 
@@ -443,6 +467,10 @@ public class FusionPipelineClient {
         }
       } else if (statusCode != 200 && statusCode != 204) {
         raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+      } else {
+        // OK!
+        if (fusionSession != null)
+          fusionSession.docsSentMeter.mark(numDocsInBatch);
       }
     } finally {
 

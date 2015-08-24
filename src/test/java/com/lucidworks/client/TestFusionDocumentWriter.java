@@ -4,6 +4,9 @@ import com.github.tomakehurst.wiremock.http.Request;
 import com.github.tomakehurst.wiremock.http.RequestListener;
 import com.github.tomakehurst.wiremock.http.Response;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
+import com.yammer.metrics.Metrics;
+import com.yammer.metrics.core.Meter;
+import com.yammer.metrics.reporting.ConsoleReporter;
 import org.apache.solr.common.SolrInputDocument;
 import org.codehaus.jackson.JsonNode;
 import org.junit.Rule;
@@ -14,6 +17,7 @@ import org.apache.commons.logging.LogFactory;
 
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 import org.codehaus.jackson.map.ObjectMapper;
 
@@ -50,6 +54,8 @@ public class TestFusionDocumentWriter {
   private static String fusionRealm;
   private static String fusionSolrProxyUrlExtension;
   private static Boolean useWireMockRule = true;
+
+  private Meter testDocsSentMeter = null;
 
   private static final Log log = LogFactory.getLog(FusionPipelineClient.class);
 
@@ -112,6 +118,13 @@ public class TestFusionDocumentWriter {
 
   @Test
   public void testFusionDocumentWriter() throws Exception {
+
+    testDocsSentMeter =
+      Metrics.newMeter(FusionDocumentWriter.metricName(FusionDocumentWriter.class, "Test Docs", fusionCollection),
+        "Number of test docs sent",
+        TimeUnit.SECONDS);
+
+    ConsoleReporter.enable(5, TimeUnit.SECONDS);
 
     String fusionHostAndPort = fusionServerHttpString + fusionHost + fusionApiPort;
     String fusionPipelineUrlWithoutHostAndPort = fusionProxyBaseUrl + fusionIndexingPipelineUrlExtension +
@@ -185,6 +198,8 @@ public class TestFusionDocumentWriter {
     idsToDelete.add("product021");
     docWriter.deleteById(1, idsToDelete);
 
+
+    Thread.sleep(6000); // to get one last metrics report logged.
   }
 
   /**
@@ -224,6 +239,9 @@ public class TestFusionDocumentWriter {
       doc.setField("name_s", "foo "+d);
       inputDocumentMap.put(docId, doc);
     }
+
+    testDocsSentMeter.mark(inputDocumentMap.size());
+
     return inputDocumentMap;
   }
 
@@ -258,6 +276,9 @@ public class TestFusionDocumentWriter {
       doc.setField("inc_ti", atomicUpdateMap);
       inputDocumentMap.put(docId, doc);
     }
+
+    testDocsSentMeter.mark(inputDocumentMap.size());
+
     return inputDocumentMap;
   }
   /**
@@ -401,6 +422,9 @@ public class TestFusionDocumentWriter {
         inputDocumentMap.put((String) product02.getFieldValue("id"), product02);
       }
     }
+
+
+    testDocsSentMeter.mark(inputDocumentMap.size());
 
     return inputDocumentMap;
   }

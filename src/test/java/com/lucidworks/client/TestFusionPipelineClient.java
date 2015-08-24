@@ -1,6 +1,7 @@
 package com.lucidworks.client;
 
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
+import com.yammer.metrics.reporting.ConsoleReporter;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.junit.Rule;
@@ -113,6 +114,8 @@ public class TestFusionPipelineClient {
   @Test
   public void testHappyPath() throws Exception {
 
+    ConsoleReporter.enable(5, TimeUnit.SECONDS);
+
     String fusionHostAndPort = "http://" + fusionHost + fusionApiPort;
     String fusionPipelineUrlWithoutHostAndPort = fusionProxyBaseUrl + fusionIndexingPipelineUrlExtension +
            fusionIndexingPipeline + fusionCollectionApiStrValForUrl + fusionCollectionForUrl +
@@ -208,6 +211,7 @@ public class TestFusionPipelineClient {
       Thread.currentThread().interrupt();
     }
 
+    Thread.sleep(6000);
   }
 
   protected List<Map<String,Object>> buildDocs(int numDocs) {
