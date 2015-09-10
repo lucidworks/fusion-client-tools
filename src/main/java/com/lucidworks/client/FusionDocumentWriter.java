@@ -43,6 +43,7 @@ public class FusionDocumentWriter {
   private String solrProxies;
   protected SolrServer solrProxy;
   private final String deleteByQueryAppendString = "|||*";
+  private String strIndexName;
 
   public FusionDocumentWriter(String indexName, Map<String, String> connectionParams) {
 
@@ -124,7 +125,7 @@ public class FusionDocumentWriter {
       Metrics.newMeter(metricName(getClass(), "Index deletes", indexName),
                       "Documents deleted from Solr index",
                       TimeUnit.SECONDS);
-
+    strIndexName = indexName;
     log.info("Fusion document writer initialized successfully for Fusion end point:[" + fusionEndpoint + "]");
   }
 
@@ -352,7 +353,10 @@ public class FusionDocumentWriter {
         }
       }
       // keep track of the time we saw this doc on the hbase side
-      fields.add(mapField("_hbasets_tdt", null, DateUtil.getThreadLocalDateFormat().format(new Date())));
+      String tdt = DateUtil.getThreadLocalDateFormat().format(new Date());
+      fields.add(mapField("_hbasets_tdt", null, tdt));
+      if (log.isDebugEnabled())
+          log.debug(strIndexName + " Reconcile id = " + docId + " and timestamp = " + tdt );
 
       json.put("fields", fields);
     } else {

@@ -165,64 +165,67 @@ public class FusionPipelineClient {
     FusionSession fusionSession = new FusionSession();
 
     if (realm != null) {
-      int at = url.indexOf("/api");
-      String proxyUrl = url.substring(0, at);
-      String sessionApi = proxyUrl + "/api/session?realmName=" + realm;
-      String jsonString = "{\"username\":\"" + user + "\", \"password\":\"" + password + "\"}"; // TODO: ugly!
+      URL theURL = new URL(url);
+      if (theURL.getPort() != 8765) {
+        int at = url.indexOf("/api");
+        String proxyUrl = url.substring(0, at);
+        String sessionApi = proxyUrl + "/api/session?realmName=" + realm;
+        String jsonString = "{\"username\":\"" + user + "\", \"password\":\"" + password + "\"}"; // TODO: ugly!
 
-      URL sessionApiUrl = new URL(sessionApi);
-      String sessionHost = sessionApiUrl.getHost();
+        URL sessionApiUrl = new URL(sessionApi);
+        String sessionHost = sessionApiUrl.getHost();
 
-      try {
-        clearCookieForHost(sessionHost);
-      } catch (Exception exc) {
-        log.warn("Failed to clear session cookie for "+sessionHost+" due to: "+exc);
-      }
+        try {
+          clearCookieForHost(sessionHost);
+        } catch (Exception exc) {
+          log.warn("Failed to clear session cookie for "+sessionHost+" due to: "+exc);
+        }
 
-      HttpPost postRequest = new HttpPost(sessionApiUrl.toURI());
-      postRequest.setEntity(new StringEntity(jsonString, ContentType.create("application/json", StandardCharsets.UTF_8)));
+        HttpPost postRequest = new HttpPost(sessionApiUrl.toURI());
+        postRequest.setEntity(new StringEntity(jsonString, ContentType.create("application/json", StandardCharsets.UTF_8)));
 
-      HttpClientContext context = HttpClientContext.create();
-      context.setCookieStore(cookieStore);
+        HttpClientContext context = HttpClientContext.create();
+        context.setCookieStore(cookieStore);
 
-      HttpResponse response = httpClient.execute(postRequest, context);
-      HttpEntity entity = response.getEntity();
-      try {
-        int statusCode = response.getStatusLine().getStatusCode();
-        if (statusCode != 200 && statusCode != 201 && statusCode != 204) {
-          String body = extractResponseBodyText(entity);
-          throw new SolrException(SolrException.ErrorCode.getErrorCode(statusCode),
-            "POST credentials to Fusion Session API [" + sessionApi + "] failed due to: " +
-              response.getStatusLine() + ": " + body);
-        } else if (statusCode == 401) {
-          // retry in case this is an expired error
-          String body = extractResponseBodyText(entity);
-          if (body != null && body.indexOf("session-idle-timeout") != -1) {
-            EntityUtils.consume(entity); // have to consume the previous entity before re-trying the request
+        HttpResponse response = httpClient.execute(postRequest, context);
+        HttpEntity entity = response.getEntity();
+        try {
+          int statusCode = response.getStatusLine().getStatusCode();
+          if (statusCode != 200 && statusCode != 201 && statusCode != 204) {
+            String body = extractResponseBodyText(entity);
+            throw new SolrException(SolrException.ErrorCode.getErrorCode(statusCode),
+              "POST credentials to Fusion Session API [" + sessionApi + "] failed due to: " +
+                response.getStatusLine() + ": " + body);
+          } else if (statusCode == 401) {
+            // retry in case this is an expired error
+            String body = extractResponseBodyText(entity);
+            if (body != null && body.indexOf("session-idle-timeout") != -1) {
+              EntityUtils.consume(entity); // have to consume the previous entity before re-trying the request
 
-            log.warn("Received session-idle-timeout error from Fusion Session API, re-trying to establish a new session to " + url);
-            try {
-              clearCookieForHost(sessionHost);
-            } catch (Exception exc) {
-              log.warn("Failed to clear session cookie for "+sessionHost+" due to: "+exc);
-            }
+              log.warn("Received session-idle-timeout error from Fusion Session API, re-trying to establish a new session to " + url);
+              try {
+                clearCookieForHost(sessionHost);
+              } catch (Exception exc) {
+                log.warn("Failed to clear session cookie for "+sessionHost+" due to: "+exc);
+              }
 
-            response = httpClient.execute(postRequest, context);
-            entity = response.getEntity();
-            statusCode = response.getStatusLine().getStatusCode();
-            if (statusCode != 200 && statusCode != 201 && statusCode != 204) {
-              body = extractResponseBodyText(entity);
-              throw new SolrException(SolrException.ErrorCode.getErrorCode(statusCode),
-                "POST credentials to Fusion Session API [" + sessionApi + "] failed due to: " +
-                  response.getStatusLine() + ": " + body);
+              response = httpClient.execute(postRequest, context);
+              entity = response.getEntity();
+              statusCode = response.getStatusLine().getStatusCode();
+              if (statusCode != 200 && statusCode != 201 && statusCode != 204) {
+                body = extractResponseBodyText(entity);
+                throw new SolrException(SolrException.ErrorCode.getErrorCode(statusCode),
+                  "POST credentials to Fusion Session API [" + sessionApi + "] failed due to: " +
+                    response.getStatusLine() + ": " + body);
+              }
             }
           }
+        } finally {
+          if (entity != null)
+            EntityUtils.consume(entity);
         }
-      } finally {
-        if (entity != null)
-          EntityUtils.consume(entity);
+        log.info("Established secure session with Fusion Session API on " + url + " for user " + user + " in realm " + realm);
       }
-      log.info("Established secure session with Fusion Session API on " + url + " for user " + user + " in realm " + realm);
     }
 
     fusionSession.sessionEstablishedAt = System.nanoTime();
