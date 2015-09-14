@@ -15,7 +15,9 @@ import org.apache.http.client.CookieStore;
 import org.apache.http.client.HttpClient;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.cookie.Cookie;
+import org.apache.http.entity.ContentProducer;
 import org.apache.http.entity.ContentType;
+import org.apache.http.entity.EntityTemplate;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.auth.BasicScheme;
 import org.apache.http.impl.client.*;
@@ -33,6 +35,7 @@ import org.apache.http.client.protocol.HttpClientContext;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.net.ConnectException;
@@ -293,7 +296,7 @@ public class FusionPipelineClient {
   
   public void postBatchToPipeline(List docs) throws Exception {
     int numDocs = docs.size();
-    String jsonBody = jsonObjectMapper.writeValueAsString(docs);
+    //String jsonBody = jsonObjectMapper.writeValueAsString(docs);
 
     int requestId = requestCounter.incrementAndGet();
     ArrayList<String> mutable = null;
@@ -339,7 +342,7 @@ public class FusionPipelineClient {
           log.debug("POSTing batch of "+numDocs+" input docs to "+endpoint+" as request "+requestId);
 
         Exception retryAfterException =
-          postJsonToPipelineWithRetry(endpoint, numDocs, jsonBody, mutable, lastExc, requestId);
+          postJsonToPipelineWithRetry(endpoint, numDocs, docs, mutable, lastExc, requestId);
         if (retryAfterException == null) {
           lastExc = null;
           break; // request succeeded ...
@@ -359,20 +362,20 @@ public class FusionPipelineClient {
       if (log.isDebugEnabled())
         log.debug("POSTing batch of "+numDocs+" input docs to "+endpoint+" as request "+requestId);
 
-      Exception exc = postJsonToPipelineWithRetry(endpoint, numDocs, jsonBody, mutable, null, requestId);
+      Exception exc = postJsonToPipelineWithRetry(endpoint, numDocs, docs, mutable, null, requestId);
       if (exc != null)
         throw exc;
     }
   }
 
-  protected Exception postJsonToPipelineWithRetry(String endpoint, int numDocsInBatch, String jsonBody,
+  protected Exception postJsonToPipelineWithRetry(String endpoint, int numDocsInBatch, List docs,
         ArrayList<String> mutable, Exception lastExc, int requestId)
     throws Exception
   {
     Exception retryAfterException = null;
 
     try {
-      postJsonToPipeline(endpoint, numDocsInBatch, jsonBody, requestId);
+      postJsonToPipeline(endpoint, numDocsInBatch, docs, requestId);
       if (lastExc != null)
         log.info("Re-try request "+requestId+" to "+endpoint+" succeeded after seeing a "+lastExc.getMessage());
     } catch (Exception exc) {
@@ -393,7 +396,7 @@ public class FusionPipelineClient {
           Thread.interrupted();
         }
         // note we want the exception to propagate from here up the stack since we re-tried and it didn't work
-        postJsonToPipeline(endpoint, numDocsInBatch, jsonBody, requestId);
+        postJsonToPipeline(endpoint, numDocsInBatch, docs, requestId);
         log.info("Re-try request " + requestId + " to " + endpoint + " succeeded");
         retryAfterException = null; // return success condition
       }
@@ -408,7 +411,23 @@ public class FusionPipelineClient {
             rootCause instanceof SocketException);
   }
 
-  public void postJsonToPipeline(String endpoint, int numDocsInBatch, String jsonBatch, int requestId) throws Exception {
+  private class JacksonContentProducer implements ContentProducer {
+
+    ObjectMapper mapper;
+    Object jsonObj;
+
+    JacksonContentProducer(ObjectMapper mapper, Object jsonObj) {
+      this.mapper = mapper;
+      this.jsonObj = jsonObj;
+    }
+
+    @Override
+    public void writeTo(OutputStream outputStream) throws IOException {
+      mapper.writeValue(outputStream, jsonObj);
+    }
+  }
+
+  public void postJsonToPipeline(String endpoint, int numDocsInBatch, List docs, int requestId) throws Exception {
 
     FusionSession fusionSession = null;
 
@@ -430,7 +449,9 @@ public class FusionPipelineClient {
     HttpEntity entity = null;
     try {
       HttpPost postRequest = new HttpPost(endpoint);
-      postRequest.setEntity(new StringEntity(jsonBatch, ContentType.create("application/json", StandardCharsets.UTF_8)));
+
+      // stream the json directly to the HTTP output
+      postRequest.setEntity(new EntityTemplate(new JacksonContentProducer(jsonObjectMapper, docs)));
 
       HttpClientContext context = HttpClientContext.create();
       context.setCookieStore(cookieStore);
