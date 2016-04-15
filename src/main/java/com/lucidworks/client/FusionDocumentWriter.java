@@ -1,3 +1,18 @@
+/*
+ * Copyright 2013 NGDATA nv
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package com.lucidworks.client;
 
 import com.yammer.metrics.Metrics;
@@ -5,9 +20,9 @@ import com.yammer.metrics.core.Meter;
 import com.yammer.metrics.core.MetricName;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.solr.client.solrj.SolrServer;
+import org.apache.solr.client.solrj.SolrClient;
 import org.apache.solr.client.solrj.SolrServerException;
-import org.apache.solr.client.solrj.impl.LBHttpSolrServer;
+import org.apache.solr.client.solrj.impl.LBHttpSolrClient;
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SolrInputDocument;
 import org.apache.solr.common.SolrInputField;
@@ -21,7 +36,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Writes updates (new documents and deletes) to Fusion.
  */
-public class FusionDocumentWriter {
+public class FusionDocumentWriter implements SolrInputDocumentWriter {
 
   private static final Log log = LogFactory.getLog(FusionDocumentWriter.class);
 
@@ -41,7 +56,7 @@ public class FusionDocumentWriter {
 
   protected FusionPipelineClient pipelineClient;
   private String solrProxies;
-  protected SolrServer solrProxy;
+  protected SolrClient solrProxy;
   private final String deleteByQueryAppendString = "|||*";
   private String strIndexName;
 
@@ -74,10 +89,10 @@ public class FusionDocumentWriter {
 
     try {
       log.info("method:FusionDocumentWriter: Create Solr proxy next; fusionSolrProxy:[" + fusionSolrProxy +
-               "], indexName:[" + indexName + "].");
-      solrProxy = new LBHttpSolrServer(pipelineClient.getHttpClient(), fusionSolrProxy.split(","));
+              "], indexName:[" + indexName + "].");
+      solrProxy = new LBHttpSolrClient(pipelineClient.getHttpClient(), fusionSolrProxy.split(","));
     } catch (Exception exc) {
-      log.error("Failed to create LBHttpSolrServer for "+fusionSolrProxy+" due to: "+exc);
+      log.error("Failed to create LBHttpSolrClient for "+fusionSolrProxy+" due to: "+exc);
       if (exc instanceof RuntimeException) {
         throw (RuntimeException)exc;
       } else {
@@ -88,43 +103,43 @@ public class FusionDocumentWriter {
     solrProxies = fusionSolrProxy; // just used for logging below
 
     fusionAddMeter = Metrics.newMeter(metricName(getClass(), "Docs sent to Fusion", indexName),
-                                      "Documents sent to Fusion",
-                                      TimeUnit.SECONDS);
+            "Documents sent to Fusion",
+            TimeUnit.SECONDS);
 
     fusionAddErrorMeter = Metrics.newMeter(metricName(getClass(), "Failed Fusion Docs", indexName),
-                                           "Failed docs sent to Fusion",
-                                           TimeUnit.SECONDS);
+            "Failed docs sent to Fusion",
+            TimeUnit.SECONDS);
 
     fusionDocsReceivedMeter =
-      Metrics.newMeter(metricName(getClass(), "Fusion Docs Received", indexName),
-                       "Docs received (to be processed for Fusion)",
-                       TimeUnit.SECONDS);
+            Metrics.newMeter(metricName(getClass(), "Fusion Docs Received", indexName),
+                    "Docs received (to be processed for Fusion)",
+                    TimeUnit.SECONDS);
 
     fusionDocsProcessedMeter =
-      Metrics.newMeter(metricName(getClass(), "Fusion Docs Flattened", indexName),
-        "Processed docs to send to Fusion (flattened parent / child docs)",
-        TimeUnit.SECONDS);
+            Metrics.newMeter(metricName(getClass(), "Fusion Docs Flattened", indexName),
+                    "Processed docs to send to Fusion (flattened parent / child docs)",
+                    TimeUnit.SECONDS);
 
 
     atomicUpdatesReceivedMeter =
-      Metrics.newMeter(metricName(getClass(), "Atomic Updates Received", indexName),
-        "Atomic updates received (before processing)",
-        TimeUnit.SECONDS);
+            Metrics.newMeter(metricName(getClass(), "Atomic Updates Received", indexName),
+                    "Atomic updates received (before processing)",
+                    TimeUnit.SECONDS);
 
     solrAtomicUpdatesMeter =
-      Metrics.newMeter(metricName(getClass(), "Atomic Updates Sent", indexName),
-                                              "Atomic updates sent to Solr",
-                                              TimeUnit.SECONDS);
+            Metrics.newMeter(metricName(getClass(), "Atomic Updates Sent", indexName),
+                    "Atomic updates sent to Solr",
+                    TimeUnit.SECONDS);
 
     solrAtomicUpdatesErrorMeter =
-      Metrics.newMeter(metricName(getClass(), "Failed Atomic Updates", indexName),
-        "Failed atomic updates due to Solr errors",
-        TimeUnit.SECONDS);
+            Metrics.newMeter(metricName(getClass(), "Failed Atomic Updates", indexName),
+                    "Failed atomic updates due to Solr errors",
+                    TimeUnit.SECONDS);
 
     indexDeleteMeter =
-      Metrics.newMeter(metricName(getClass(), "Index deletes", indexName),
-                      "Documents deleted from Solr index",
-                      TimeUnit.SECONDS);
+            Metrics.newMeter(metricName(getClass(), "Index deletes", indexName),
+                    "Documents deleted from Solr index",
+                    TimeUnit.SECONDS);
     strIndexName = indexName;
     log.info("Fusion document writer initialized successfully for Fusion end point:[" + fusionEndpoint + "]");
   }
@@ -160,7 +175,7 @@ public class FusionDocumentWriter {
           fusionAddMeter.mark(numFusionDocsRcvd);
         } catch (Exception e) {
           log.warn("FusionPipelineClient failed to process batch of "+numFusionDocsRcvd+
-            " docs due to: "+e+"; will re-try each doc individually");
+                  " docs due to: "+e+"; will re-try each doc individually");
           retryFusionAddsIndividually(fusionDocs);
         }
       }
@@ -197,8 +212,8 @@ public class FusionDocumentWriter {
           for (Map.Entry<String, Object> entry : ((Map<String, Object>) val).entrySet()) {
             String key = entry.getKey();
             if (key.equals("add")    || key.equals("set")||
-                key.equals("remove") || key.equals("removeregex") ||
-                key.equals("inc")) {
+                    key.equals("remove") || key.equals("removeregex") ||
+                    key.equals("inc")) {
               // keep track of the time we saw this doc on the hbase side
               Map<String,String> atomicUpdateMap = new HashMap<String, String>();
               atomicUpdateMap.put("set", DateUtil.getThreadLocalDateFormat().format(new Date()));
@@ -240,7 +255,7 @@ public class FusionDocumentWriter {
         solrAtomicUpdatesMeter.mark(atomicUpdateDocuments.size());
       } catch (Exception e) {
         log.warn("Solr failed to process batch of "+atomicUpdateDocuments.size()+
-          " atomic updates due to: "+e+"; will re-try each doc individually");
+                " atomic updates due to: "+e+"; will re-try each doc individually");
         retrySolrAtomicUpdatesIndividually(atomicUpdateDocuments);
       }
     }
@@ -265,14 +280,14 @@ public class FusionDocumentWriter {
     boolean isDebugEnabled = log.isDebugEnabled();
     if (isDebugEnabled) {
       log.debug("Method:toJsonDocs - Processing SolrInputDocuments: parent:[" + (parentSolrDoc == null ? "null" : parentSolrDoc.toString()) +
-        "] with " + childSolrDocs.size() + " child documents.");
+              "] with " + childSolrDocs.size() + " child documents.");
     }
 
     List<Map<String,Object>> list = new ArrayList<Map<String,Object>>(childSolrDocs.size());
     for (SolrInputDocument childSolrDoc : childSolrDocs) {
       if (isDebugEnabled) {
         log.debug("Method:toJsonDocs - Processing SolrInputDocuments: parent:[" + (parentSolrDoc == null ? "null" : parentSolrDoc.toString()) +
-          "]; child:[" + childSolrDoc.toString() + "]");
+                "]; child:[" + childSolrDoc.toString() + "]");
       }
       list.addAll(toJson(parentSolrDoc, childSolrDoc, docCount));
     }
@@ -336,7 +351,7 @@ public class FusionDocumentWriter {
       if (parent != null) {
         if (log.isDebugEnabled())
           log.debug("Method:doc2json - Merging parent and child docs, parent:[" + parent.toString() +
-                "]; child[" + child.toString() + "].");
+                  "]; child[" + child.toString() + "].");
 
         // have a parent doc ... flatten by adding all parent doc fields to the child with prefix _p_
         for (String f : parent.getFieldNames()) {
@@ -356,7 +371,7 @@ public class FusionDocumentWriter {
       String tdt = DateUtil.getThreadLocalDateFormat().format(new Date());
       fields.add(mapField("_hbasets_tdt", null, tdt));
       if (log.isDebugEnabled())
-          log.debug(strIndexName + " Reconcile id = " + docId + " and timestamp = " + tdt );
+        log.debug(strIndexName + " Reconcile id = " + docId + " and timestamp = " + tdt );
 
       json.put("fields", fields);
     } else {
@@ -420,7 +435,7 @@ public class FusionDocumentWriter {
         solrAtomicUpdatesMeter.mark();
       } catch (Exception e) {
         log.error("Failed to index atomic update document [" + nextDoc.get("id") + "] due to: " + e + "; doc: " + nextDoc +
-          "solrProxy:[" + solrProxy.toString() + "]");
+                "solrProxy:[" + solrProxy.toString() + "]");
         solrAtomicUpdatesErrorMeter.mark();
       }
     }
@@ -430,7 +445,7 @@ public class FusionDocumentWriter {
 
     int len = 15;
     String listLogInfo = (idsToDelete.size() > len) ?
-      (idsToDelete.subList(0,len).toString()+" + "+(idsToDelete.size()-len)+" more ...") : idsToDelete.toString();
+            (idsToDelete.subList(0,len).toString()+" + "+(idsToDelete.size()-len)+" more ...") : idsToDelete.toString();
     log.info("Sending a deleteById '"+idsToDelete+"' to Solr(s) at: "+solrProxies);
 
     boolean deleteByIdsSucceeded = false;
@@ -444,8 +459,8 @@ public class FusionDocumentWriter {
       deleteByQuery(idsToDelete, "id", deleteByQueryAppendString);
     } catch (Exception e) {
       log.error("Delete docs by " + (deleteByIdsSucceeded ? "query" : "id") + " failed due to: "+e+"; ids: " +
-                 idsToDelete+ (deleteByIdsSucceeded ? " appended with '" + deleteByQueryAppendString : "") +
-                ". Retry deleting individually by id.");
+              idsToDelete+ (deleteByIdsSucceeded ? " appended with '" + deleteByQueryAppendString : "") +
+              ". Retry deleting individually by id.");
       retryDeletesIndividually(idsToDelete, deleteByIdsSucceeded);
     }
   }
