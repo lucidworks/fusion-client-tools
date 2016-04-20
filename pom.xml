@@ -124,6 +124,59 @@
           <target>1.7</target>
         </configuration>
       </plugin>
+
+      <!-- Shaded Plugin -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>2.4.3</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+
+              <artifactSet>
+                <excludes>
+                  <!-- any JARS that we want to exclude from this uber jar -->
+                  <exclude>org.slf4j:slf4j-log4j12</exclude>
+                  <exclude>org.slf4j:slf4j-api</exclude>
+                  <exclude>commons-logging:commons-logging</exclude>
+                  <exclude>org.apache.solr:solr-core</exclude>
+                </excludes>
+              </artifactSet>
+
+              <relocations>
+                <relocation>
+                  <pattern>org.apache</pattern>
+                  <shadedPattern>shaded.apache</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.codehaus</pattern>
+                  <shadedPattern>shaded.codehaus</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.noggit</pattern>
+                  <shadedPattern>shaded.noggit</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.ctc</pattern>
+                  <shadedPattern>shaded.ctc</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.yammer</pattern>
+                  <shadedPattern>shaded.yammer</shadedPattern>
+                </relocation>
+              </relocations>
+
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+
     </plugins>
   </build>
 </project>
