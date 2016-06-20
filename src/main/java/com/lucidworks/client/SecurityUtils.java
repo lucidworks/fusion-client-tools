@@ -2,10 +2,8 @@
  * LucidWorks, Inc. Developer License Agreement
  *
  */
-
 package com.lucidworks.client;
 
-import org.apache.solr.client.solrj.impl.HttpClientConfigurer;
 import org.apache.solr.client.solrj.impl.HttpClientUtil;
 import org.apache.solr.client.solrj.impl.Krb5HttpClientConfigurer;
 import org.apache.commons.logging.Log;
