@@ -1,12 +1,12 @@
 package com.lucidworks.client;
 
+import com.codahale.metrics.ConsoleReporter;
+import com.codahale.metrics.Meter;
+
 import com.github.tomakehurst.wiremock.http.Request;
 import com.github.tomakehurst.wiremock.http.RequestListener;
 import com.github.tomakehurst.wiremock.http.Response;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Meter;
-import com.yammer.metrics.reporting.ConsoleReporter;
 import org.apache.solr.common.SolrInputDocument;
 import org.codehaus.jackson.JsonNode;
 import org.junit.Rule;
@@ -119,13 +119,6 @@ public class TestFusionDocumentWriter {
   @Test
   public void testFusionDocumentWriter() throws Exception {
 
-    testDocsSentMeter =
-      Metrics.newMeter(FusionDocumentWriter.metricName(FusionDocumentWriter.class, "Test Docs", fusionCollection),
-        "Number of test docs sent",
-        TimeUnit.SECONDS);
-
-    ConsoleReporter.enable(5, TimeUnit.SECONDS);
-
     String fusionHostAndPort = fusionServerHttpString + fusionHost + fusionApiPort;
     String fusionPipelineUrlWithoutHostAndPort = fusionProxyBaseUrl + fusionIndexingPipelineUrlExtension +
            fusionIndexingPipeline + "/collections" + fusionCollectionForUrl +
@@ -133,13 +126,6 @@ public class TestFusionDocumentWriter {
     String fusionUrl = fusionHostAndPort + fusionPipelineUrlWithoutHostAndPort;
     String fusionSolrProxyWithoutHostAndPort = fusionProxyBaseUrl + fusionSolrProxyUrlExtension + fusionCollectionForUrl;
     String fusionSolrProxy = fusionHostAndPort + fusionSolrProxyWithoutHostAndPort;
-
-    Map<String,String> config = new HashMap<String,String>();
-    config.put("fusion.pipeline", fusionUrl);
-    config.put("fusion.solrproxy", fusionSolrProxy);
-    config.put("fusion.user", fusionUser);
-    config.put("fusion.pass", fusionPass);
-    config.put("fusion.realm", fusionRealm);
 
     if (useWireMockRule) {
       // mock out the Pipeline API
@@ -154,11 +140,6 @@ public class TestFusionDocumentWriter {
       // stubFor(post(urlEqualTo("/api/apollo/solr")).willReturn(aResponse().withStatus(200)));
       stubFor(post(urlEqualTo(fusionSolrProxyWithoutHostAndPort)).willReturn(aResponse().withStatus(200)));
 
-    }
-    // FusionDocumentWriter docWriter = new FusionDocumentWriter("agentCollection" /* indexName */, config);
-    FusionDocumentWriter docWriter = new FusionDocumentWriter(fusionCollection /* indexName */, config);
-
-    if (useWireMockRule) {
       // register a callback to validate the request that came into our mock pipeline endpoint
       wireMockRule.addMockServiceRequestListener(new RequestListener() {
         public void requestReceived(Request request, Response response) {
@@ -166,6 +147,23 @@ public class TestFusionDocumentWriter {
         }
       });
     }
+
+    Map<String,String> config = new HashMap<String,String>();
+    config.put("fusion.pipeline", fusionUrl);
+    config.put("fusion.solrproxy", fusionSolrProxy);
+    config.put("fusion.user", fusionUser);
+    config.put("fusion.pass", fusionPass);
+    config.put("fusion.realm", fusionRealm);
+
+    FusionDocumentWriter docWriter = new FusionDocumentWriter(fusionCollection /* indexName */, config);
+    testDocsSentMeter =
+            docWriter.getMetricRegistry().meter(FusionDocumentWriter.metricName(FusionDocumentWriter.class, "Test Docs", fusionCollection));
+
+    final ConsoleReporter reporter = ConsoleReporter.forRegistry(docWriter.getMetricRegistry())
+            .convertRatesTo(TimeUnit.SECONDS)
+            .convertDurationsTo(TimeUnit.MILLISECONDS)
+            .build();
+    reporter.start(5, TimeUnit.SECONDS);
 
     log.info("======================================================================================");
     log.info("Adding one document from buildInputDocs().");

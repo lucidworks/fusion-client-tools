@@ -1,8 +1,7 @@
 package com.lucidworks.client;
 
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Meter;
-import com.yammer.metrics.core.MetricName;
+import com.codahale.metrics.Meter;
+import com.codahale.metrics.MetricRegistry;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.solr.client.solrj.SolrClient;
@@ -16,7 +15,6 @@ import org.apache.solr.common.util.DateUtil;
 
 import java.io.IOException;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Writes updates (new documents and deletes) to Fusion.
@@ -25,8 +23,8 @@ public class FusionDocumentWriter implements SolrInputDocumentWriter {
 
   private static final Log log = LogFactory.getLog(FusionDocumentWriter.class);
 
-  public static MetricName metricName(Class<?> producerClass, String metric, String indexerName) {
-    return new MetricName("Lucidworks", producerClass.getSimpleName(), metric, indexerName);
+  public static String metricName(Class<?> producerClass, String metric, String indexerName) {
+    return MetricRegistry.name("Lucidworks", producerClass.getSimpleName(), metric, indexerName);
   }
 
   private Meter atomicUpdatesReceivedMeter;
@@ -36,10 +34,11 @@ public class FusionDocumentWriter implements SolrInputDocumentWriter {
   private Meter solrAtomicUpdatesMeter;
   private Meter solrAtomicUpdatesErrorMeter;
   private Meter fusionDocsProcessedMeter;
-
   private Meter indexDeleteMeter;
+  private MetricRegistry metricRegistry;
 
   protected FusionPipelineClient pipelineClient;
+  protected String fusionIndexPipelinePath;
   private String solrProxies;
   protected SolrClient solrProxy;
   private final String deleteByQueryAppendString = "|||*";
@@ -47,10 +46,14 @@ public class FusionDocumentWriter implements SolrInputDocumentWriter {
 
   public FusionDocumentWriter(String indexName, Map<String, String> connectionParams) {
 
-
     String fusionEndpoint = connectionParams.get("fusion.pipeline");
     if (fusionEndpoint == null)
       throw new IllegalStateException("The 'fusion.pipeline' parameter is required when using Lucidworks Fusion!");
+
+    String fusionHostList = FusionPipelineClient.extractFusionHosts(fusionEndpoint);
+    log.info("Configured Fusion host and port list: "+fusionHostList);
+    fusionIndexPipelinePath = FusionPipelineClient.extractPath(fusionEndpoint);
+    log.info("Configured Fusion index pipeline path: "+fusionIndexPipelinePath);
 
     String fusionSolrProxy = connectionParams.get("fusion.solrproxy");
     if (fusionSolrProxy == null)
@@ -62,7 +65,7 @@ public class FusionDocumentWriter implements SolrInputDocumentWriter {
 
     log.info("Connecting to Fusion pipeline "+fusionEndpoint+" as "+fusionUser+", realm="+fusionRealm);
     try {
-      pipelineClient = new FusionPipelineClient(fusionEndpoint, fusionUser, fusionPass, fusionRealm);
+      pipelineClient = new FusionPipelineClient(fusionHostList, fusionUser, fusionPass, fusionRealm);
     } catch (Exception exc) {
       log.error("Failed to create FusionPipelineClient for "+fusionEndpoint+" due to: "+exc);
       if (exc instanceof RuntimeException) {
@@ -85,48 +88,24 @@ public class FusionDocumentWriter implements SolrInputDocumentWriter {
       }
     }
 
+    metricRegistry = new MetricRegistry();
+    pipelineClient.setMetricsRegistry(metricRegistry);
+
     solrProxies = fusionSolrProxy; // just used for logging below
-
-    fusionAddMeter = Metrics.newMeter(metricName(getClass(), "Docs sent to Fusion", indexName),
-            "Documents sent to Fusion",
-            TimeUnit.SECONDS);
-
-    fusionAddErrorMeter = Metrics.newMeter(metricName(getClass(), "Failed Fusion Docs", indexName),
-            "Failed docs sent to Fusion",
-            TimeUnit.SECONDS);
-
-    fusionDocsReceivedMeter =
-            Metrics.newMeter(metricName(getClass(), "Fusion Docs Received", indexName),
-                    "Docs received (to be processed for Fusion)",
-                    TimeUnit.SECONDS);
-
-    fusionDocsProcessedMeter =
-            Metrics.newMeter(metricName(getClass(), "Fusion Docs Flattened", indexName),
-                    "Processed docs to send to Fusion (flattened parent / child docs)",
-                    TimeUnit.SECONDS);
-
-
-    atomicUpdatesReceivedMeter =
-            Metrics.newMeter(metricName(getClass(), "Atomic Updates Received", indexName),
-                    "Atomic updates received (before processing)",
-                    TimeUnit.SECONDS);
-
-    solrAtomicUpdatesMeter =
-            Metrics.newMeter(metricName(getClass(), "Atomic Updates Sent", indexName),
-                    "Atomic updates sent to Solr",
-                    TimeUnit.SECONDS);
-
-    solrAtomicUpdatesErrorMeter =
-            Metrics.newMeter(metricName(getClass(), "Failed Atomic Updates", indexName),
-                    "Failed atomic updates due to Solr errors",
-                    TimeUnit.SECONDS);
-
-    indexDeleteMeter =
-            Metrics.newMeter(metricName(getClass(), "Index deletes", indexName),
-                    "Documents deleted from Solr index",
-                    TimeUnit.SECONDS);
+    fusionAddMeter = metricRegistry.meter(metricName(getClass(), "Docs sent to Fusion", indexName));
+    fusionAddErrorMeter = metricRegistry.meter(metricName(getClass(), "Failed Fusion Docs", indexName));
+    fusionDocsReceivedMeter = metricRegistry.meter(metricName(getClass(), "Fusion Docs Received", indexName));
+    fusionDocsProcessedMeter = metricRegistry.meter(metricName(getClass(), "Fusion Docs Flattened", indexName));
+    atomicUpdatesReceivedMeter = metricRegistry.meter(metricName(getClass(), "Atomic Updates Received", indexName));
+    solrAtomicUpdatesMeter = metricRegistry.meter(metricName(getClass(), "Atomic Updates Sent", indexName));
+    solrAtomicUpdatesErrorMeter = metricRegistry.meter(metricName(getClass(), "Failed Atomic Updates", indexName));
+    indexDeleteMeter = metricRegistry.meter(metricName(getClass(), "Index deletes", indexName));
     strIndexName = indexName;
     log.info("Fusion document writer initialized successfully for Fusion end point:[" + fusionEndpoint + "]");
+  }
+
+  public MetricRegistry getMetricRegistry() {
+    return metricRegistry;
   }
 
   public void add(int shard, Map<String, SolrInputDocument> inputDocumentMap) throws SolrServerException, IOException {
@@ -156,7 +135,7 @@ public class FusionDocumentWriter implements SolrInputDocumentWriter {
       if (numFusionDocsRcvd > 0) {
         fusionDocsProcessedMeter.mark(numFusionDocsRcvd);
         try {
-          pipelineClient.postBatchToPipeline(fusionDocs);
+          pipelineClient.postBatchToPipeline(fusionIndexPipelinePath, fusionDocs);
           fusionAddMeter.mark(numFusionDocsRcvd);
         } catch (Exception e) {
           log.warn("FusionPipelineClient failed to process batch of "+numFusionDocsRcvd+
@@ -395,7 +374,7 @@ public class FusionDocumentWriter implements SolrInputDocumentWriter {
   private void retryFusionAddsIndividually(List<Map<String,Object>> docs) throws SolrServerException, IOException {
     for (Map<String,Object> next : docs) {
       try {
-        pipelineClient.postBatchToPipeline(Collections.singletonList(next));
+        pipelineClient.postBatchToPipeline(fusionIndexPipelinePath, Collections.singletonList(next));
         fusionAddMeter.mark();
       } catch (Exception e) {
         log.error("Failed to index document ["+next.get("id")+"] due to: " + e + "; doc: " + next);

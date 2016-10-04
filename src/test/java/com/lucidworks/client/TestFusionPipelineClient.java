@@ -1,7 +1,6 @@
 package com.lucidworks.client;
 
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
-import com.yammer.metrics.reporting.ConsoleReporter;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.junit.Rule;
@@ -114,8 +113,6 @@ public class TestFusionPipelineClient {
   @Test
   public void testHappyPath() throws Exception {
 
-    ConsoleReporter.enable(5, TimeUnit.SECONDS);
-
     String fusionHostAndPort = "http://" + fusionHost + fusionApiPort;
     String fusionPipelineUrlWithoutHostAndPort = fusionProxyBaseUrl + fusionIndexingPipelineUrlExtension +
            fusionIndexingPipeline + fusionCollectionApiStrValForUrl + fusionCollectionForUrl +
@@ -127,7 +124,7 @@ public class TestFusionPipelineClient {
       " fusionPipelineUrlWithoutHostAndPort=" + fusionPipelineUrlWithoutHostAndPort +
       " wireMockRulePort=" + wireMockRulePort + " useWireMockRule=" + useWireMockRule);
 
-    String badPath = "/api/apollo/index-pipelines/scottsCollection-default/collections/badCollection/index";
+    final String badPath = "/api/apollo/index-pipelines/scottsCollection-default/collections/badCollection/index";
     String unauthPath = "/api/apollo/index-pipelines/scottsCollection-default/collections/unauthCollection/index";
     if (useWireMockRule) {
       // mock out the Pipeline API
@@ -150,8 +147,12 @@ public class TestFusionPipelineClient {
         ",http://localhost:"+wireMockRulePort+badPath+
         ",http://localhost:"+wireMockRulePort+unauthPath : fusionUrl;
 
+    String fusionHostList = FusionPipelineClient.extractFusionHosts(fusionEndpoints);
+    final String fusionIndexPipelinePath =
+            useWireMockRule ? fusionPipelineUrlWithoutHostAndPort : FusionPipelineClient.extractPath(fusionEndpoints);
+
     final FusionPipelineClient pipelineClient =
-      new FusionPipelineClient(fusionEndpoints, fusionUser, fusionPass, fusionRealm);
+      new FusionPipelineClient(fusionHostList, fusionUser, fusionPass, fusionRealm);
 
     int numThreads = 3;
     ExecutorService pool = Executors.newFixedThreadPool(numThreads);
@@ -161,7 +162,8 @@ public class TestFusionPipelineClient {
         public Object call() throws Exception {
           for (int i = 0; i < 10; i++) {
             try {
-              pipelineClient.postBatchToPipeline(buildDocs(1));
+              List<Map<String,Object>> docs = buildDocs(1);
+              pipelineClient.postBatchToPipeline(fusionIndexPipelinePath, docs);
             } catch (Exception exc) {
               log.error("\n\nFailed to postBatch due to: " + exc+"\n\n");
               throw new RuntimeException(exc);
@@ -171,29 +173,6 @@ public class TestFusionPipelineClient {
         }
       });
     }
-
-    /*
-    log.info("Sleeping for 10 minutes to let sessions expire");
-    Thread.sleep(602*1000);
-    log.info("Done sleeping for 10 minutes ... resending docs");
-
-    for (int t=0; t < numThreads; t++) {
-      pool.submit(new Callable<Object>() {
-        @Override
-        public Object call() throws Exception {
-          for (int i = 0; i < 10; i++) {
-            try {
-              pipelineClient.postBatchToPipeline(buildDocs(1));
-            } catch (Exception exc) {
-              log.error("\n\nFailed to postBatch due to: " + exc+"\n\n");
-              throw new RuntimeException(exc);
-            }
-          }
-          return null;
-        }
-      });
-    }
-    */
 
     pool.shutdown(); // Disable new tasks from being submitted
     try {

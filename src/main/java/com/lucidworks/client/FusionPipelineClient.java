@@ -1,8 +1,9 @@
 package com.lucidworks.client;
 
-import com.yammer.metrics.Metrics;
-import com.yammer.metrics.core.Meter;
-import com.yammer.metrics.core.MetricName;
+import com.codahale.metrics.Meter;
+import com.codahale.metrics.MetricRegistry;
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVPrinter;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.http.HttpEntity;
@@ -13,44 +14,111 @@ import org.apache.http.HttpResponse;
 import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.client.CookieStore;
 import org.apache.http.client.HttpClient;
+import org.apache.http.client.config.CookieSpecs;
+import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.HttpUriRequest;
+import org.apache.http.client.protocol.HttpClientContext;
 import org.apache.http.cookie.Cookie;
 import org.apache.http.entity.ContentProducer;
 import org.apache.http.entity.ContentType;
 import org.apache.http.entity.EntityTemplate;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.auth.BasicScheme;
-import org.apache.http.impl.client.*;
+import org.apache.http.impl.client.BasicCookieStore;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.cookie.BasicClientCookie;
 import org.apache.http.protocol.HttpContext;
 import org.apache.http.util.EntityUtils;
-import org.apache.solr.client.solrj.SolrClient;
 import org.apache.solr.client.solrj.SolrQuery;
 import org.apache.solr.client.solrj.impl.HttpClientUtil;
 import org.apache.solr.client.solrj.impl.HttpSolrClient;
+import org.apache.solr.client.solrj.impl.Krb5HttpClientConfigurer;
 import org.apache.solr.client.solrj.impl.XMLResponseParser;
 import org.apache.solr.client.solrj.request.QueryRequest;
 import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.common.SolrException;
 import org.codehaus.jackson.map.ObjectMapper;
 
-import org.apache.http.client.config.CookieSpecs;
-import org.apache.http.client.config.RequestConfig;
-import org.apache.http.client.protocol.HttpClientContext;
-
 import java.io.*;
+import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.net.ConnectException;
-import java.net.MalformedURLException;
-import java.net.SocketException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class FusionPipelineClient {
 
   private static final Log log = LogFactory.getLog(FusionPipelineClient.class);
+
+  public static final String PIPELINE_DOC_TYPE = "application/vnd.lucidworks-document";
+
+  public static final String LWWW_JAAS_FILE = "lww.jaas.file";
+  public static final String LWWW_JAAS_APPNAME = "lww.jaas.appname";
+
+  public static String extractFusionHosts(String endpointList) {
+    StringBuilder hostAndPortList = new StringBuilder();
+    String[] endpoints = endpointList.split(",");
+    for (String ep : endpoints) {
+      ep = ep.trim();
+      if (ep.isEmpty()) continue;
+
+      try {
+        URL fusionUrl = new URL(ep);
+        if (hostAndPortList.length() > 0) {
+          hostAndPortList.append(",");
+        }
+        int port = fusionUrl.getPort();
+        hostAndPortList.append(fusionUrl.getProtocol()).append("://").append(fusionUrl.getHost());
+        hostAndPortList.append(":").append(port);
+      } catch (MalformedURLException exc) {
+        throw new RuntimeException("Cannot parse Fusion endpoint '"+ep+"' into a URL due to: "+exc);
+      }
+    }
+    return hostAndPortList.toString();
+  }
+
+  public static String extractPath(String endpointList) {
+    String[] endpoints = endpointList.split(",");
+    String ep = endpoints[0];
+    ep = ep.trim();
+    if (ep.isEmpty()) {
+      throw new IllegalArgumentException("No Fusion path information available in "+endpointList);
+    }
+
+    String path;
+    try {
+      URL fusionUrl = new URL(ep);
+      path = fusionUrl.getPath();
+      String queryString = fusionUrl.getQuery();
+      if (queryString != null && !path.contains(queryString)) {
+        path += "?"+queryString;
+      }
+    } catch (MalformedURLException exc) {
+      throw new RuntimeException("Cannot parse Fusion endpoint '"+ep+"' into a URL due to: "+exc);
+    }
+    return path;
+  }
+
+  public static void setSecurityConfig(String jassFile) {
+    if (jassFile == null)
+      return;
+
+    log.info("Using kerberized Solr.");
+    System.setProperty("sun.security.krb5.debug", "true");
+    System.setProperty("java.security.auth.login.config", jassFile);
+    final String appname = System.getProperty(LWWW_JAAS_APPNAME, "Client");
+    System.setProperty("solr.kerberos.jaas.appname", appname);
+    HttpClientUtil.setConfigurer(new Krb5HttpClientConfigurer());
+  }
 
   // for basic auth to the pipeline service
   private static final class PreEmptiveBasicAuthenticator implements HttpRequestInterceptor {
@@ -67,50 +135,60 @@ public class FusionPipelineClient {
 
   // holds a context and a client object
   static class FusionSession {
+    String id;
     long sessionEstablishedAt = -1;
     Meter docsSentMeter = null;
     HttpSolrClient solrClient = null;
+
+    public String toString() {
+
+      StringBuilder sb = new StringBuilder();
+      sb.append(id);
+      if (sessionEstablishedAt > 0) {
+        sb.append(": ").append(TimeUnit.SECONDS.convert(sessionEstablishedAt, TimeUnit.NANOSECONDS));
+      }
+      if (docsSentMeter != null) {
+        sb.append(", docsSent: ").append(docsSentMeter.getCount());
+      }
+      return sb.toString();
+    }
   }
 
-  List<String> originalEndpoints;
+  List<String> originalHostAndPortList;
   RequestConfig globalConfig;
   CookieStore cookieStore;
   CloseableHttpClient httpClient;
 
-  Map<String,FusionSession> sessions;
+  Map<String, FusionSession> sessions;
   Random random;
   ObjectMapper jsonObjectMapper;
   String fusionUser = null;
   String fusionPass = null;
   String fusionRealm = null;
   AtomicInteger requestCounter = null;
-  Map<String,Meter> metersByHost = new HashMap<String,Meter>();
+  Map<String, Meter> metersByHost = new HashMap<>();
   boolean isKerberos = false;
+
+  MetricRegistry metrics = null;
 
   static long maxNanosOfInactivity = TimeUnit.NANOSECONDS.convert(599, TimeUnit.SECONDS);
 
-  private static MetricName metricName(String metric, String endpoint) {
-    return new MetricName("Lucidworks", "FusionPipelineClient", metric, endpoint);
+  public FusionPipelineClient(String fusionHostAndPortList) throws MalformedURLException {
+    this(fusionHostAndPortList, null, null, null);
   }
 
-  public FusionPipelineClient(String endpointUrl) throws MalformedURLException {
-    this(endpointUrl, null, null, null);
-  }
-
-  public FusionPipelineClient(String endpointUrl, String fusionUser, String fusionPass, String fusionRealm) throws MalformedURLException {
+  public FusionPipelineClient(String fusionHostAndPortList, String fusionUser, String fusionPass, String fusionRealm) throws MalformedURLException {
 
     this.fusionUser = fusionUser;
     this.fusionPass = fusionPass;
     this.fusionRealm = fusionRealm;
 
-    // see if kerberos is enabled?
-    String lwwJaasFile = System.getProperty(SecurityUtils.LWWW_JAAS_FILE);
+    String lwwJaasFile = System.getProperty(LWWW_JAAS_FILE);
     if (lwwJaasFile != null && !lwwJaasFile.isEmpty()) {
-      System.setProperty("sun.security.krb5.debug", "true");
-      SecurityUtils.setSecurityConfig();
+      setSecurityConfig(lwwJaasFile);
       httpClient = HttpClientUtil.createClient(null);
-      HttpClientUtil.setMaxConnections(httpClient, 500);
-      HttpClientUtil.setMaxConnectionsPerHost(httpClient, 100);
+      HttpClientUtil.setMaxConnections(httpClient, 1000);
+      HttpClientUtil.setMaxConnectionsPerHost(httpClient, 1000);
       isKerberos = true;
     } else {
       globalConfig = RequestConfig.custom().setCookieSpec(CookieSpecs.BEST_MATCH).build();
@@ -119,8 +197,8 @@ public class FusionPipelineClient {
       // build the HttpClient to be used for all requests
       HttpClientBuilder httpClientBuilder = HttpClientBuilder.create();
       httpClientBuilder.setDefaultRequestConfig(globalConfig).setDefaultCookieStore(cookieStore);
-      httpClientBuilder.setMaxConnPerRoute(100);
-      httpClientBuilder.setMaxConnTotal(500);
+      httpClientBuilder.setMaxConnPerRoute(1000);
+      httpClientBuilder.setMaxConnTotal(1000);
 
       if (fusionUser != null && fusionRealm == null)
         httpClientBuilder.addInterceptorFirst(new PreEmptiveBasicAuthenticator(fusionUser, fusionPass));
@@ -128,12 +206,12 @@ public class FusionPipelineClient {
       httpClient = httpClientBuilder.build();
     }
 
-    originalEndpoints = Arrays.asList(endpointUrl.split(","));
+    originalHostAndPortList = Arrays.asList(fusionHostAndPortList.split(","));
     try {
-      sessions = establishSessions(originalEndpoints, fusionUser, fusionPass, fusionRealm);
+      sessions = establishSessions(originalHostAndPortList, fusionUser, fusionPass, fusionRealm);
     } catch (Exception exc) {
       if (exc instanceof RuntimeException) {
-        throw (RuntimeException)exc;
+        throw (RuntimeException) exc;
       } else {
         throw new RuntimeException(exc);
       }
@@ -145,27 +223,42 @@ public class FusionPipelineClient {
     requestCounter = new AtomicInteger(0);
   }
 
+  public String getFusionUser() { return fusionUser; }
+  public String getFusionRealm() { return fusionRealm; }
+
+  public void setMetricsRegistry(MetricRegistry metrics) {
+    this.metrics = metrics;
+  }
+
   protected Meter getMeterByHost(String meterName, String host) {
-    String key = meterName+" ("+host+")";
-    Meter meter =  metersByHost.get(key);
+
+    if (metrics == null)
+      return null;
+
+    String key = meterName + " (" + host + ")";
+    Meter meter = metersByHost.get(key);
     if (meter == null) {
-      meter = Metrics.newMeter(metricName(meterName, host), key, TimeUnit.SECONDS);
+      meter = metrics.meter(meterName + "-" + host);
       metersByHost.put(key, meter);
     }
     return meter;
   }
 
-  protected Map<String,FusionSession> establishSessions(List<String> endpoints, String user, String password, String realm) throws Exception {
+  protected Map<String, FusionSession> establishSessions(List<String> hostAndPortList, String user, String password, String realm) throws Exception {
 
     Exception lastError = null;
-    Map<String,FusionSession> map = new HashMap<String, FusionSession>();
-    for (String url : endpoints) {
-      try {
-        map.put(url, establishSession(url, user, password, realm));
-      } catch (Exception exc) {
-        // just log this ... so long as there is at least one good endpoint we can use it
-        lastError = exc;
-        log.warn("Failed to establish session with Fusion at " + url+" due to: "+exc);
+    Map<String, FusionSession> map = new HashMap<>();
+    for (String url : hostAndPortList) {
+      String sessionKey = getSessionKey(url);
+      if (!map.containsKey(sessionKey)) {
+        try {
+          FusionSession session = establishSession(sessionKey, user, password, realm);
+          map.put(session.id, session);
+        } catch (Exception exc) {
+          // just log this ... so long as there is at least one good endpoint we can use it
+          lastError = exc;
+          log.warn("Failed to establish session with Fusion at " + sessionKey + " due to: " + exc);
+        }
       }
     }
 
@@ -173,33 +266,34 @@ public class FusionPipelineClient {
       if (lastError != null) {
         throw lastError;
       } else {
-        throw new Exception("Failed to establish session with Fusion endpoint(s): "+endpoints);
+        throw new Exception("Failed to establish session with Fusion host(s): " + hostAndPortList);
       }
     }
 
-    log.info("Established sessions with "+map.size()+" of "+endpoints.size()+
-            " Fusion endpoints for user "+user+" in realm "+realm);
+    log.info("Established sessions with " + map.size() + " of " + hostAndPortList.size() +
+            " Fusion hosts for user " + user + " in realm " + realm);
 
     return map;
   }
 
-  protected FusionSession establishSession(String url, String user, String password, String realm) throws Exception {
+  protected FusionSession establishSession(String sessionKey, String user, String password, String realm) throws Exception {
+
+    if (!sessionKey.startsWith("https://") && !sessionKey.startsWith("http://")) {
+      sessionKey = "http://" + sessionKey;
+    }
 
     FusionSession fusionSession = new FusionSession();
 
     if (!isKerberos && realm != null) {
-      int at = url.indexOf("/api");
-      String proxyUrl = url.substring(0, at);
-      String sessionApi = proxyUrl + "/api/session?realmName=" + realm;
-      String jsonString = "{\"username\":\"" + user + "\", \"password\":\"" + password + "\"}"; // TODO: ugly!
 
+      String sessionApi = sessionKey + "/api/session?realmName=" + realm;
+      String jsonString = "{\"username\":\"" + user + "\", \"password\":\"" + password + "\"}";
       URL sessionApiUrl = new URL(sessionApi);
       String sessionHost = sessionApiUrl.getHost();
-
       try {
         clearCookieForHost(sessionHost);
       } catch (Exception exc) {
-        log.warn("Failed to clear session cookie for "+sessionHost+" due to: "+exc);
+        log.warn("Failed to clear session cookie for " + sessionHost + " due to: " + exc);
       }
 
       HttpPost postRequest = new HttpPost(sessionApiUrl.toURI());
@@ -223,11 +317,11 @@ public class FusionPipelineClient {
           if (body != null && body.indexOf("session-idle-timeout") != -1) {
             EntityUtils.consume(entity); // have to consume the previous entity before re-trying the request
 
-            log.warn("Received session-idle-timeout error from Fusion Session API, re-trying to establish a new session to " + url);
+            log.warn("Received session-idle-timeout error from Fusion Session API, re-trying to establish a new session to " + sessionKey);
             try {
               clearCookieForHost(sessionHost);
             } catch (Exception exc) {
-              log.warn("Failed to clear session cookie for "+sessionHost+" due to: "+exc);
+              log.warn("Failed to clear session cookie for " + sessionHost + " due to: " + exc);
             }
 
             response = httpClient.execute(postRequest, context);
@@ -245,14 +339,12 @@ public class FusionPipelineClient {
         if (entity != null)
           EntityUtils.consume(entity);
       }
-      log.info("Established secure session with Fusion Session API on " + url + " for user " + user + " in realm " + realm);
+      log.info("Established secure session with Fusion Session API on " + sessionKey + " for user " + user + " in realm " + realm);
     }
 
     fusionSession.sessionEstablishedAt = System.nanoTime();
-
-    URL fusionUrl = new URL(url);
-    String hostAndPort = fusionUrl.getHost()+":"+fusionUrl.getPort();
-    fusionSession.docsSentMeter = getMeterByHost("Docs Sent to Fusion", hostAndPort);
+    fusionSession.docsSentMeter = getMeterByHost("Docs Sent to Fusion", sessionKey);
+    fusionSession.id = sessionKey;
 
     return fusionSession;
   }
@@ -264,8 +356,7 @@ public class FusionPipelineClient {
       if (cookieDomain != null) {
         if (sessionHost.equals(cookieDomain) ||
                 sessionHost.indexOf(cookieDomain) != -1 ||
-                cookieDomain.indexOf(sessionHost) != -1)
-        {
+                cookieDomain.indexOf(sessionHost) != -1) {
           sessionCookie = cookie;
           break;
         }
@@ -273,8 +364,7 @@ public class FusionPipelineClient {
     }
 
     if (sessionCookie != null) {
-      BasicClientCookie httpCookie =
-              new BasicClientCookie(sessionCookie.getName(),sessionCookie.getValue());
+      BasicClientCookie httpCookie = new BasicClientCookie(sessionCookie.getName(), sessionCookie.getValue());
       httpCookie.setExpiryDate(new Date(0));
       httpCookie.setVersion(1);
       httpCookie.setPath(sessionCookie.getPath());
@@ -285,15 +375,42 @@ public class FusionPipelineClient {
     cookieStore.clearExpired(new Date()); // this should clear the cookie
   }
 
-  protected synchronized FusionSession resetSession(String endpoint) throws Exception {
+  protected String getSessionKey(String url) throws Exception {
+    if (!url.startsWith("http://") && !url.startsWith("https://"))
+      url = "http://"+url;
+    URL javaUrl = new URL(url);
+    return javaUrl.getProtocol() + "://" + javaUrl.getHost() + ":" + javaUrl.getPort();
+  }
+
+  protected FusionSession getSession(String url, int requestId) throws Exception {
+    String sessionKey = getSessionKey(url);
+    FusionSession fusionSession;
+    synchronized (this) {
+      fusionSession = sessions.get(sessionKey);
+
+      // ensure last request within the session timeout period, else reset the session
+      long currTime = System.nanoTime();
+      if (fusionSession == null || (currTime - fusionSession.sessionEstablishedAt) > maxNanosOfInactivity) {
+        log.info("Fusion session is likely expired (or soon will be) for " + url + ", " +
+                "pre-emptively re-setting this session before processing request " + requestId);
+        fusionSession = resetSession(sessionKey);
+        if (fusionSession == null)
+          throw new IllegalStateException("Failed to re-connect to " + url +
+                  " after session loss when processing request " + requestId);
+      }
+    }
+    return fusionSession;
+  }
+
+  protected synchronized FusionSession resetSession(String sessionKey) throws Exception {
     // reset the "context" object for the HttpContext for this endpoint
-    FusionSession fusionSession = null;
+    FusionSession fusionSession;
     try {
-      fusionSession = establishSession(endpoint, fusionUser, fusionPass, fusionRealm);
-      sessions.put(endpoint, fusionSession);
+      fusionSession = establishSession(sessionKey, fusionUser, fusionPass, fusionRealm);
+      sessions.put(fusionSession.id, fusionSession);
     } catch (Exception exc) {
-      log.error("Failed to re-establish session with Fusion at " + endpoint + " due to: " + exc);
-      sessions.remove(endpoint);
+      log.error("Failed to re-establish session with Fusion at " + sessionKey + " due to: " + exc);
+      sessions.remove(sessionKey);
       fusionSession = null;
     }
     return fusionSession;
@@ -303,7 +420,19 @@ public class FusionPipelineClient {
     return httpClient;
   }
 
-  protected String getLbEndpoint(List<String> list) {
+  public String getAvailableServer() {
+    try {
+      return getLbServer(getAvailableServers());
+    } catch (Exception exc) {
+      if (exc instanceof RuntimeException) {
+        throw (RuntimeException)exc;
+      } else {
+        throw new RuntimeException(exc);
+      }
+    }
+  }
+
+  protected String getLbServer(List<String> list) {
     int num = list.size();
     if (num == 0)
       return null;
@@ -311,10 +440,10 @@ public class FusionPipelineClient {
     return list.get((num > 1) ? random.nextInt(num) : 0);
   }
 
-  protected ArrayList<String> getAvailableEndpoints() throws Exception {
-    ArrayList<String> mutable = null;
+  public ArrayList<String> getAvailableServers() throws Exception {
+    ArrayList<String> mutable;
     synchronized (this) {
-      mutable = new ArrayList<String>(sessions.keySet());
+      mutable = new ArrayList<>(sessions.keySet());
     }
 
     if (mutable.isEmpty()) {
@@ -326,8 +455,8 @@ public class FusionPipelineClient {
           Thread.interrupted();
         }
 
-        sessions = establishSessions(originalEndpoints, fusionUser, fusionPass, fusionRealm);
-        mutable = new ArrayList<String>(sessions.keySet());
+        sessions = establishSessions(originalHostAndPortList, fusionUser, fusionPass, fusionRealm);
+        mutable = new ArrayList<>(sessions.keySet());
       }
       if (mutable.isEmpty())
         throw new IllegalStateException("No available endpoints! " +
@@ -337,39 +466,47 @@ public class FusionPipelineClient {
     return mutable;
   }
 
-  public void postBatchToPipeline(List docs) throws Exception {
+  public void postBatchToPipeline(String pipelinePath, List docs) throws Exception {
+    postBatchToPipeline(pipelinePath, docs, PIPELINE_DOC_TYPE);
+  }
+
+  public void postBatchToPipeline(String pipelinePath, List docs, String contentType) throws Exception {
+
     int numDocs = docs.size();
 
+    if (!pipelinePath.startsWith("/"))
+      pipelinePath = "/" + pipelinePath;
+
     int requestId = requestCounter.incrementAndGet();
-    ArrayList<String> mutable = getAvailableEndpoints();
+
+    ArrayList<String> mutable = getAvailableServers();
     if (mutable.size() > 1) {
       Exception lastExc = null;
 
       // try all the endpoints until success is reached ... or we run out of endpoints to try ...
       while (!mutable.isEmpty()) {
-        String endpoint = getLbEndpoint(mutable);
-        if (endpoint == null) {
+        String hostAndPort = getLbServer(mutable);
+        if (hostAndPort == null) {
           // no more endpoints available ... fail
           if (lastExc != null) {
-            log.error("No more endpoints available to retry failed request ("+requestId+")! raising last seen error: "+lastExc);
+            log.error("No more hosts available to retry failed request (" + requestId + ")! raising last seen error: " + lastExc);
             throw lastExc;
           } else {
-            throw new RuntimeException("No Fusion pipeline endpoints available to process request "+
-                    requestId+"! Check logs for previous errors.");
+            throw new RuntimeException("No Fusion hosts available to process request " + requestId + "! Check logs for previous errors.");
           }
         }
 
         if (log.isDebugEnabled())
-          log.debug("POSTing batch of "+numDocs+" input docs to "+endpoint+" as request "+requestId);
+          log.debug("POSTing batch of " + numDocs + " input docs to " + hostAndPort + pipelinePath + " as request " + requestId);
 
         Exception retryAfterException =
-                postJsonToPipelineWithRetry(endpoint, docs, mutable, lastExc, requestId);
+                postDocsToPipelineWithRetry(hostAndPort, pipelinePath, docs, mutable, lastExc, requestId, contentType);
         if (retryAfterException == null) {
           lastExc = null;
           break; // request succeeded ...
         }
 
-        lastExc = retryAfterException; // try next endpoint (if available) after seeing an exception
+        lastExc = retryAfterException; // try next hostAndPort (if available) after seeing an exception
       }
 
       if (lastExc != null) {
@@ -379,56 +516,55 @@ public class FusionPipelineClient {
       }
 
     } else {
-      String endpoint = getLbEndpoint(mutable);
+      String hostAndPort = getLbServer(mutable);
       if (log.isDebugEnabled())
-        log.debug("POSTing batch of "+numDocs+" input docs to "+endpoint+" as request "+requestId);
+        log.debug("POSTing batch of " + numDocs + " input docs to " + hostAndPort + pipelinePath + " as request " + requestId);
 
-      Exception exc = postJsonToPipelineWithRetry(endpoint, docs, mutable, null, requestId);
+      Exception exc = postDocsToPipelineWithRetry(hostAndPort, pipelinePath, docs, mutable, null, requestId, contentType);
       if (exc != null)
         throw exc;
     }
   }
 
-  protected Exception postJsonToPipelineWithRetry(String endpoint, List docs, ArrayList<String> mutable, Exception lastExc, int requestId)
-          throws Exception
-  {
+  protected Exception postDocsToPipelineWithRetry(String hostAndPort,
+                                                  String pipelinePath,
+                                                  List docs,
+                                                  ArrayList<String> mutable,
+                                                  Exception lastExc,
+                                                  int requestId,
+                                                  String contentType)
+          throws Exception {
+    String url = hostAndPort + pipelinePath;
     Exception retryAfterException = null;
-
     try {
-      postJsonToPipeline(endpoint, docs, requestId);
+      postDocsToPipeline(hostAndPort, pipelinePath, docs, requestId, contentType);
       if (lastExc != null)
-        log.info("Re-try request "+requestId+" to "+endpoint+" succeeded after seeing a "+lastExc.getMessage());
+        log.info("Re-try request " + requestId + " to " + url + " succeeded after seeing a " + lastExc.getMessage());
     } catch (Exception exc) {
-      log.warn("Failed to send request "+requestId+" to '"+endpoint+"' due to: "+exc);
+      log.warn("Failed to send request " + requestId + " to '" + url + "' due to: " + exc);
       if (mutable.size() > 1) {
-        // try another endpoint but update the cloned list to avoid re-hitting the one having an error
+        // try another hostAndPort but update the cloned list to avoid re-hitting the one having an error
         if (log.isDebugEnabled())
-          log.debug("Will re-try failed request " + requestId + " on next endpoint in the list");
+          log.debug("Will re-try failed request " + requestId + " on next host in the list");
 
-        mutable.remove(endpoint);
+        mutable.remove(hostAndPort);
         retryAfterException = exc;
       } else {
         // no other endpoints to try ... brief wait and then retry
-        log.warn("No more endpoints available to try ... will retry to send request "+ requestId+" to "+endpoint+" after waiting 1 sec");
+        log.warn("No more Fusion servers available to try ... will retry to send request " + requestId + " to " + url + " after waiting 1 sec");
         try {
           Thread.sleep(1000);
         } catch (InterruptedException ignore) {
           Thread.interrupted();
         }
         // note we want the exception to propagate from here up the stack since we re-tried and it didn't work
-        postJsonToPipeline(endpoint, docs, requestId);
-        log.info("Re-try request " + requestId + " to " + endpoint + " succeeded");
+        postDocsToPipeline(hostAndPort, pipelinePath, docs, requestId, contentType);
+        log.info("Re-try request " + requestId + " to " + url + " succeeded");
         retryAfterException = null; // return success condition
       }
     }
 
     return retryAfterException;
-  }
-
-  private static boolean shouldRetry(Exception exc) {
-    Throwable rootCause = SolrException.getRootCause(exc);
-    return (rootCause instanceof ConnectException ||
-            rootCause instanceof SocketException);
   }
 
   private class JacksonContentProducer implements ContentProducer {
@@ -446,36 +582,53 @@ public class FusionPipelineClient {
     }
   }
 
-  public void postJsonToPipeline(String endpoint, List docs, int requestId) throws Exception {
+  private class CsvContentProducer implements ContentProducer {
 
-    FusionSession fusionSession = null;
+    List docs;
 
-    long currTime = System.nanoTime();
-    synchronized (this) {
-      fusionSession = sessions.get(endpoint);
+    CsvContentProducer(List docs) {
+      this.docs = docs;
+    }
 
-      // ensure last request within the session timeout period, else reset the session
-      if (fusionSession == null || (currTime - fusionSession.sessionEstablishedAt) > maxNanosOfInactivity) {
-        log.info("Fusion session is likely expired (or soon will be) for endpoint "+endpoint+", " +
-                "pre-emptively re-setting this session before processing request "+requestId);
-        fusionSession = resetSession(endpoint);
-        if (fusionSession == null)
-          throw new IllegalStateException("Failed to re-connect to "+endpoint+
-                  " after session loss when processing request "+requestId);
+    public void writeTo(OutputStream outputStream) throws IOException {
+      try (OutputStreamWriter osw = new OutputStreamWriter(outputStream, StandardCharsets.UTF_8)) {
+        CSVPrinter csvPrinter = new CSVPrinter(osw, CSVFormat.DEFAULT);
+        for (Object doc : docs) {
+          if (doc instanceof Map) {
+            Map<String,Object> map = (Map<String,Object>)doc;
+            csvPrinter.printRecord(map.values());
+          } else {
+            csvPrinter.print(doc);
+            csvPrinter.println();
+          }
+        }
+        csvPrinter.flush();
+        csvPrinter.close();
       }
     }
+  }
+
+
+  public void postDocsToPipeline(String hostAndPort, String pipelinePath, List docs, int requestId, String contentType) throws Exception {
+    FusionSession fusionSession = getSession(hostAndPort, requestId);
+    String postUrl = hostAndPort + pipelinePath;
+    if (postUrl.indexOf("?") != -1) {
+      postUrl += "&echo=false";
+    } else {
+      postUrl += "?echo=false";
+    }
+
+    HttpPost postRequest = new HttpPost(postUrl);
+    ContentProducer cp = newContentProducer(contentType, docs);
+    EntityTemplate et = new EntityTemplate(cp);
+    et.setContentType(contentType);
+    et.setContentEncoding(StandardCharsets.UTF_8.name());
+    postRequest.setEntity(et);
 
     HttpEntity entity = null;
     try {
-      HttpPost postRequest = new HttpPost(endpoint);
 
-      // stream the json directly to the HTTP output
-      EntityTemplate et = new EntityTemplate(new JacksonContentProducer(jsonObjectMapper, docs));
-      et.setContentType("application/json");
-      et.setContentEncoding(StandardCharsets.UTF_8.name());
-      postRequest.setEntity(et); // new BufferedHttpEntity(et));
-
-      HttpResponse response = null;
+      HttpResponse response;
       HttpClientContext context = null;
       if (isKerberos) {
         response = httpClient.execute(postRequest);
@@ -486,46 +639,45 @@ public class FusionPipelineClient {
         }
         response = httpClient.execute(postRequest, context);
       }
-
       entity = response.getEntity();
+
       int statusCode = response.getStatusLine().getStatusCode();
       if (statusCode == 401) {
         // unauth'd - session probably expired? retry to establish
         log.warn("Unauthorized error (401) when trying to send request " + requestId +
-                " to Fusion at " + endpoint + ", will re-try to establish session");
+                " to Fusion at " + hostAndPort + ", will re-try to establish session");
 
         // re-establish the session and re-try the request
         try {
           EntityUtils.consume(entity);
         } catch (Exception ignore) {
-          log.warn("Failed to consume entity due to: "+ignore);
+          log.warn("Failed to consume entity due to: " + ignore);
         } finally {
           entity = null;
         }
 
         synchronized (this) {
-          fusionSession = resetSession(endpoint);
+          fusionSession = resetSession(hostAndPort);
           if (fusionSession == null)
-            throw new IllegalStateException("After re-establishing session when processing request "+
-                    requestId+", endpoint "+endpoint+" is no longer active! Try another endpoint.");
+            throw new IllegalStateException("After re-establishing session when processing request " +
+                    requestId + ", hostAndPort " + hostAndPort + " is no longer active! Try another hostAndPort.");
         }
 
-        log.info("Going to re-try request "+requestId+" after session re-established with "+endpoint);
+        log.info("Going to re-try request " + requestId + " after session re-established with " + hostAndPort);
         if (isKerberos) {
           response = httpClient.execute(postRequest);
         } else {
           response = httpClient.execute(postRequest, context);
         }
-
         entity = response.getEntity();
         statusCode = response.getStatusLine().getStatusCode();
         if (statusCode == 200 || statusCode == 204) {
-          log.info("Re-try request "+requestId+" after session timeout succeeded for: " + endpoint);
+          log.info("Re-try request " + requestId + " after session timeout succeeded for: " + hostAndPort);
         } else {
-          raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+          raiseFusionServerException(hostAndPort, entity, statusCode, response, requestId);
         }
       } else if (statusCode != 200 && statusCode != 204) {
-        raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+        raiseFusionServerException(hostAndPort, entity, statusCode, response, requestId);
       } else {
         // OK!
         if (fusionSession != null && fusionSession.docsSentMeter != null)
@@ -537,54 +689,154 @@ public class FusionPipelineClient {
         try {
           EntityUtils.consume(entity);
         } catch (Exception ignore) {
-          log.warn("Failed to consume entity due to: "+ignore);
-        } finally {
-          entity = null;
+          log.warn("Failed to consume entity due to: " + ignore);
         }
       }
     }
   }
 
-  public QueryResponse queryFusion(SolrQuery query) throws Exception {
+  protected ContentProducer newContentProducer(String contentType, List docs) {
+    if ("text/csv".equals(contentType)) {
+      return new CsvContentProducer(docs);
+    } else if (PIPELINE_DOC_TYPE.equals(contentType)) {
+      return new JacksonContentProducer(jsonObjectMapper, docs);
+    } else {
+      throw new IllegalArgumentException("Content type "+contentType+" not supported! Use text/csv or "+PIPELINE_DOC_TYPE);
+    }
+  }
+
+  public QueryResponse queryFusion(String queryPipelinePath, SolrQuery query) throws Exception {
 
     int requestId = requestCounter.incrementAndGet();
 
-    ArrayList<String> mutable = getAvailableEndpoints();
-    String endpoint = mutable.get(0);
+    ArrayList<String> mutable = getAvailableServers();
+    String fusionHost = mutable.get(0);
 
-    FusionSession fusionSession = null;
+    FusionSession fusionSession;
     long currTime = System.nanoTime();
     synchronized (this) {
-      fusionSession = sessions.get(endpoint);
+      fusionSession = sessions.get(fusionHost);
 
       // ensure last request within the session timeout period, else reset the session
       if (fusionSession == null || (currTime - fusionSession.sessionEstablishedAt) > maxNanosOfInactivity) {
-        log.info("Fusion session is likely expired (or soon will be) for endpoint "+endpoint+", " +
+        log.info("Fusion session is likely expired (or soon will be) for host "+fusionHost+", " +
                 "pre-emptively re-setting this session before processing request "+requestId);
-        fusionSession = resetSession(endpoint);
+        fusionSession = resetSession(fusionHost);
         if (fusionSession == null)
-          throw new IllegalStateException("Failed to re-connect to "+endpoint+
+          throw new IllegalStateException("Failed to re-connect to "+fusionHost+
                   " after session loss when processing request "+requestId);
       }
     }
 
     if (fusionSession.solrClient == null) {
-      fusionSession.solrClient = new HttpSolrClient(endpoint, httpClient);
+      String baseUrl = fusionHost+queryPipelinePath;
+      fusionSession.solrClient = new HttpSolrClient(baseUrl, httpClient);
     }
+
+    //log.info("Sending query to: "+fusionSession.solrClient.getBaseURL());
+
+    query.set("wt", "xml");
     QueryRequest qreq = new QueryRequest(query);
     qreq.setResponseParser(new XMLResponseParser());
-    QueryResponse qr = new QueryResponse((SolrClient)fusionSession.solrClient);
+    QueryResponse qr = new QueryResponse(fusionSession.solrClient);
+    if (log.isDebugEnabled()) {
+      log.debug("Sending query ["+query+"] to "+fusionSession.solrClient.getBaseURL());
+    }
     qr.setResponse(fusionSession.solrClient.request(qreq));
     return qr;
+  }
+
+  public HttpEntity sendRequestToFusion(HttpUriRequest httpRequest) throws Exception {
+    return sendRequestToFusion(httpRequest, true);
+  }
+
+  public HttpEntity sendRequestToFusion(HttpUriRequest httpRequest, boolean retry) throws Exception {
+
+    String endpoint = httpRequest.getRequestLine().getUri();
+    int requestId = requestCounter.incrementAndGet();
+    FusionSession fusionSession = getSession(endpoint, requestId);
+
+    HttpEntity entity;
+    HttpResponse response;
+    HttpClientContext context = null;
+
+    if (log.isDebugEnabled()) {
+      log.debug("Sending "+httpRequest.getMethod()+" request to: "+endpoint);
+    }
+
+    if (isKerberos) {
+      response = httpClient.execute(httpRequest);
+    } else {
+      context = HttpClientContext.create();
+      if (cookieStore != null) {
+        context.setCookieStore(cookieStore);
+      }
+      response = httpClient.execute(httpRequest, context);
+    }
+
+    entity = response.getEntity();
+    int statusCode = response.getStatusLine().getStatusCode();
+    if (log.isDebugEnabled()) {
+      log.debug(httpRequest.getMethod()+" request to "+endpoint+" returned: "+statusCode);
+    }
+
+    if (!retry) {
+      if (statusCode == 200 || statusCode == 204) {
+        return entity;
+      } else {
+        raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+      }
+    }
+
+    if (statusCode == 401) {
+      // unauth'd - session probably expired? retry to establish
+      log.warn("Unauthorized error (401) when trying to send request " + requestId +
+              " to Fusion at " + endpoint + ", will re-try to establish session");
+
+      // re-establish the session and re-try the request
+      try {
+        EntityUtils.consume(entity);
+      } catch (Exception ignore) {
+        log.warn("Failed to consume entity due to: " + ignore);
+      } finally {
+        entity = null;
+      }
+
+      String sessionKey = fusionSession.id;
+      synchronized (this) {
+        fusionSession = resetSession(sessionKey);
+        if (fusionSession == null)
+          throw new IllegalStateException("After re-establishing session when processing request " +
+                  requestId + ", Fusion host " + sessionKey + " is no longer active! Try another server.");
+      }
+
+      log.info("Going to re-try request " + requestId + " after session re-established with " + sessionKey);
+
+      if (isKerberos) {
+        response = httpClient.execute(httpRequest);
+      } else {
+        response = httpClient.execute(httpRequest, context);
+      }
+      entity = response.getEntity();
+      statusCode = response.getStatusLine().getStatusCode();
+      if (statusCode == 200 || statusCode == 204) {
+        log.info("Re-try request " + requestId + " after session timeout succeeded for: " + endpoint);
+      } else {
+        raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+      }
+    } else if (statusCode != 200 && statusCode != 204) {
+      raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+    }
+    return entity;
   }
 
   protected void raiseFusionServerException(String endpoint, HttpEntity entity, int statusCode, HttpResponse response, int requestId) {
     String body = extractResponseBodyText(entity);
     throw new SolrException(SolrException.ErrorCode.getErrorCode(statusCode),
-            "POST request "+requestId+" to [" + endpoint + "] failed due to: ("+statusCode+")" + response.getStatusLine() + ": " + body);
+            "Request " + requestId + " to [" + endpoint + "] failed due to: (" + statusCode + ")" + response.getStatusLine() + ": " + body);
   }
 
-  static String extractResponseBodyText(HttpEntity entity) {
+  public static String extractResponseBodyText(HttpEntity entity) {
     StringBuilder body = new StringBuilder();
     if (entity != null) {
       BufferedReader reader = null;
@@ -595,12 +847,13 @@ public class FusionPipelineClient {
           body.append(line);
       } catch (Exception ignore) {
         // squelch it - just trying to compose an error message here
-        log.warn("Failed to read response body due to: "+ignore);
+        log.warn("Failed to read response body due to: " + ignore);
       } finally {
         if (reader != null) {
           try {
             reader.close();
-          } catch (Exception ignore){}
+          } catch (Exception ignore) {
+          }
         }
       }
     }
