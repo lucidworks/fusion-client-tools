@@ -16,6 +16,7 @@ import org.apache.http.client.CookieStore;
 import org.apache.http.client.HttpClient;
 import org.apache.http.client.config.CookieSpecs;
 import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.client.protocol.HttpClientContext;
@@ -39,6 +40,7 @@ import org.apache.solr.client.solrj.impl.XMLResponseParser;
 import org.apache.solr.client.solrj.request.QueryRequest;
 import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.common.SolrException;
+import org.apache.solr.common.util.NamedList;
 import org.codehaus.jackson.map.ObjectMapper;
 
 import java.io.*;
@@ -706,43 +708,76 @@ public class FusionPipelineClient {
   }
 
   public QueryResponse queryFusion(String queryPipelinePath, SolrQuery query) throws Exception {
-
-    int requestId = requestCounter.incrementAndGet();
-
-    ArrayList<String> mutable = getAvailableServers();
-    String fusionHost = mutable.get(0);
-
-    FusionSession fusionSession;
-    long currTime = System.nanoTime();
-    synchronized (this) {
-      fusionSession = sessions.get(fusionHost);
-
-      // ensure last request within the session timeout period, else reset the session
-      if (fusionSession == null || (currTime - fusionSession.sessionEstablishedAt) > maxNanosOfInactivity) {
-        log.info("Fusion session is likely expired (or soon will be) for host "+fusionHost+", " +
-                "pre-emptively re-setting this session before processing request "+requestId);
-        fusionSession = resetSession(fusionHost);
-        if (fusionSession == null)
-          throw new IllegalStateException("Failed to re-connect to "+fusionHost+
-                  " after session loss when processing request "+requestId);
-      }
-    }
-
-    if (fusionSession.solrClient == null) {
-      String baseUrl = fusionHost+queryPipelinePath;
-      fusionSession.solrClient = new HttpSolrClient(baseUrl, httpClient);
-    }
-
-    //log.info("Sending query to: "+fusionSession.solrClient.getBaseURL());
-
     query.set("wt", "xml");
-    QueryRequest qreq = new QueryRequest(query);
-    qreq.setResponseParser(new XMLResponseParser());
-    QueryResponse qr = new QueryResponse(fusionSession.solrClient);
-    if (log.isDebugEnabled()) {
-      log.debug("Sending query ["+query+"] to "+fusionSession.solrClient.getBaseURL());
+
+    String queryPath = queryPipelinePath+"?"+query;
+
+    QueryResponse qr = null;
+    int requestId = requestCounter.incrementAndGet();
+    ArrayList<String> mutable = getAvailableServers();
+    if (mutable.size() > 1) {
+      Exception lastExc = null;
+
+      // try all the endpoints until success is reached ... or we run out of endpoints to try ...
+      while (!mutable.isEmpty()) {
+        String hostAndPort = getLbServer(mutable);
+        if (hostAndPort == null) {
+          // no more endpoints available ... fail
+          if (lastExc != null) {
+            log.error("No more hosts available to retry failed request (" + requestId + ")! raising last seen error: " + lastExc);
+            throw lastExc;
+          } else {
+            throw new RuntimeException("No Fusion hosts available to process request " + requestId + "! Check logs for previous errors.");
+          }
+        }
+
+        Exception retryAfterException = null;
+        try {
+          qr = sendQuery(hostAndPort, queryPath, requestId);
+          retryAfterException = null;
+        } catch (Exception exc) {
+          retryAfterException = exc;
+        }
+
+        if (retryAfterException == null) {
+          lastExc = null;
+          break; // request succeeded ...
+        }
+
+        lastExc = retryAfterException; // try next hostAndPort (if available) after seeing an exception
+      }
+
+      if (lastExc != null) {
+        // request failed and we exhausted the list of endpoints to try ...
+        log.error("Failing request " + requestId + " due to: " + lastExc);
+        throw lastExc;
+      }
+
+    } else {
+      String hostAndPort = getLbServer(mutable);
+      qr = sendQuery(hostAndPort, queryPath, requestId);
     }
-    qr.setResponse(fusionSession.solrClient.request(qreq));
+    return qr;
+  }
+
+  protected QueryResponse sendQuery(String hostAndPort, String query, int requestId) throws Exception {
+    HttpGet getReq = new HttpGet(hostAndPort+query);
+    HttpEntity getResp = sendRequestToFusion(getReq, true, requestId);
+    XMLResponseParser responseParser = new XMLResponseParser();
+    Reader reader = null;
+    QueryResponse qr = null;
+    try {
+      reader = new BufferedReader(new InputStreamReader(getResp.getContent()));
+      NamedList<Object> parsedResp = responseParser.processResponse(reader);
+      qr = new QueryResponse(parsedResp, null);
+    } finally {
+      if (reader != null) {
+        try {
+          reader.close();
+        } catch (Exception ignore) {}
+      }
+      EntityUtils.consumeQuietly(getResp);
+    }
     return qr;
   }
 
@@ -751,10 +786,14 @@ public class FusionPipelineClient {
   }
 
   public HttpEntity sendRequestToFusion(HttpUriRequest httpRequest, boolean retry) throws Exception {
+    return sendRequestToFusion(httpRequest, retry, requestCounter.incrementAndGet());
+  }
 
+  public HttpEntity sendRequestToFusion(HttpUriRequest httpRequest, boolean retry, int requestId) throws Exception {
     String endpoint = httpRequest.getRequestLine().getUri();
-    int requestId = requestCounter.incrementAndGet();
-    FusionSession fusionSession = getSession(endpoint, requestId);
+    URL url = httpRequest.getURI().toURL();
+    String hostAndPort = url.getProtocol()+"://"+url.getHost()+":"+url.getPort();
+    FusionSession fusionSession = getSession(hostAndPort, requestId);
 
     HttpEntity entity;
     HttpResponse response;

@@ -151,10 +151,10 @@
 
               <artifactSet>
                 <excludes>
-                  <!-- any JARS that we want to exclude from this uber jar -->
+                  <!-- any JARS that we want to exclude from this uber jar
                   <exclude>org.slf4j:slf4j-log4j12</exclude>
                   <exclude>org.slf4j:slf4j-api</exclude>
-                  <exclude>commons-logging:commons-logging</exclude>
+                  <exclude>commons-logging:commons-logging</exclude> -->
                   <exclude>org.apache.solr:solr-core</exclude>
                 </excludes>
               </artifactSet>
@@ -172,10 +172,12 @@
                   <pattern>org.noggit</pattern>
                   <shadedPattern>shaded.noggit</shadedPattern>
                 </relocation>
+                <!--
                 <relocation>
                   <pattern>com.ctc</pattern>
                   <shadedPattern>shaded.ctc</shadedPattern>
                 </relocation>
+                -->
                 <relocation>
                   <pattern>com.yammer</pattern>
                   <shadedPattern>shaded.yammer</shadedPattern>
