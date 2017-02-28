@@ -1,6 +1,8 @@
 package com.lucidworks.client;
 
+import com.carrotsearch.ant.tasks.junit4.dependencies.com.google.common.collect.HashBiMap;
 import com.github.tomakehurst.wiremock.junit.WireMockRule;
+import org.apache.commons.collections.map.HashedMap;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.junit.Rule;
@@ -162,7 +164,7 @@ public class TestFusionPipelineClient {
         public Object call() throws Exception {
           for (int i = 0; i < 10; i++) {
             try {
-              List<Map<String,Object>> docs = buildDocs(1);
+              List<Map<String,Object>> docs = buildPipelineDocs(1);
               pipelineClient.postBatchToPipeline(fusionIndexPipelinePath, docs);
             } catch (Exception exc) {
               log.error("\n\nFailed to postBatch due to: " + exc+"\n\n");
@@ -193,14 +195,25 @@ public class TestFusionPipelineClient {
     Thread.sleep(6000);
   }
 
-  protected List<Map<String,Object>> buildDocs(int numDocs) {
+  protected List<Map<String,Object>> buildPipelineDocs(int numDocs) {
     List<Map<String,Object>> docs = new ArrayList<Map<String,Object>>(numDocs);
     for (int n=0; n < numDocs; n++) {
       Map<String,Object> doc = new HashMap<String, Object>();
+
+      List<Map<String,Object>> listOfFields = new LinkedList<>();
+      listOfFields.add(pipelineDocField("str_s", "str "+n));
+
       doc.put("id", "doc"+n);
-      doc.put("str_s", "str "+n);
+      doc.put("fields", listOfFields);
       docs.add(doc);
     }
     return docs;
+  }
+
+  protected Map<String,Object> pipelineDocField(String fieldName, Object value) {
+    Map<String,Object> field = new HashMap<>();
+    field.put("name", fieldName);
+    field.put("value", value);
+    return field;
   }
 }

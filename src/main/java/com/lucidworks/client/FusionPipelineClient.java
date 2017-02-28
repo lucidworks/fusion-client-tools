@@ -700,7 +700,7 @@ public class FusionPipelineClient {
   protected ContentProducer newContentProducer(String contentType, List docs) {
     if ("text/csv".equals(contentType)) {
       return new CsvContentProducer(docs);
-    } else if (PIPELINE_DOC_TYPE.equals(contentType)) {
+    } else if (PIPELINE_DOC_TYPE.equals(contentType) || "application/json".equals(contentType)) {
       return new JacksonContentProducer(jsonObjectMapper, docs);
     } else {
       throw new IllegalArgumentException("Content type "+contentType+" not supported! Use text/csv or "+PIPELINE_DOC_TYPE);
