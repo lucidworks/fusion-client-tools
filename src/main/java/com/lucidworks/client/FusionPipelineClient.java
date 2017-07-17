@@ -6,11 +6,13 @@ import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVPrinter;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.apache.http.Header;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpException;
 import org.apache.http.HttpRequest;
 import org.apache.http.HttpRequestInterceptor;
 import org.apache.http.HttpResponse;
+import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.auth.UsernamePasswordCredentials;
 import org.apache.http.client.CookieStore;
 import org.apache.http.client.HttpClient;
@@ -304,9 +306,12 @@ public class FusionPipelineClient {
       HttpClientContext context = HttpClientContext.create();
       context.setCookieStore(cookieStore);
 
-      HttpResponse response = httpClient.execute(postRequest, context);
-      HttpEntity entity = response.getEntity();
+      CloseableHttpResponse response = null;
+      HttpEntity entity = null;
       try {
+        response = httpClient.execute(postRequest, context);
+        entity = response.getEntity();
+
         int statusCode = response.getStatusLine().getStatusCode();
         if (statusCode != 200 && statusCode != 201 && statusCode != 204) {
           String body = extractResponseBodyText(entity);
@@ -317,7 +322,9 @@ public class FusionPipelineClient {
           // retry in case this is an expired error
           String body = extractResponseBodyText(entity);
           if (body != null && body.indexOf("session-idle-timeout") != -1) {
-            EntityUtils.consume(entity); // have to consume the previous entity before re-trying the request
+            EntityUtils.consumeQuietly(entity); // have to consume the previous entity before re-trying the request
+            entity = null;
+            response.close();
 
             log.warn("Received session-idle-timeout error from Fusion Session API, re-trying to establish a new session to " + sessionKey);
             try {
@@ -338,8 +345,8 @@ public class FusionPipelineClient {
           }
         }
       } finally {
-        if (entity != null)
-          EntityUtils.consume(entity);
+        EntityUtils.consumeQuietly(entity);
+        if (response != null) response.close();
       }
       log.info("Established secure session with Fusion Session API on " + sessionKey + " for user " + user + " in realm " + realm);
     }
@@ -628,9 +635,9 @@ public class FusionPipelineClient {
     postRequest.setEntity(et);
 
     HttpEntity entity = null;
+    CloseableHttpResponse response = null;
     try {
 
-      HttpResponse response;
       HttpClientContext context = null;
       if (isKerberos) {
         response = httpClient.execute(postRequest);
@@ -650,13 +657,9 @@ public class FusionPipelineClient {
                 " to Fusion at " + hostAndPort + ", will re-try to establish session");
 
         // re-establish the session and re-try the request
-        try {
-          EntityUtils.consume(entity);
-        } catch (Exception ignore) {
-          log.warn("Failed to consume entity due to: " + ignore);
-        } finally {
-          entity = null;
-        }
+        EntityUtils.consumeQuietly(entity);
+        entity = null;
+        response.close();
 
         synchronized (this) {
           fusionSession = resetSession(hostAndPort);
@@ -686,14 +689,8 @@ public class FusionPipelineClient {
           fusionSession.docsSentMeter.mark(docs.size());
       }
     } finally {
-
-      if (entity != null) {
-        try {
-          EntityUtils.consume(entity);
-        } catch (Exception ignore) {
-          log.warn("Failed to consume entity due to: " + ignore);
-        }
-      }
+      EntityUtils.consumeQuietly(entity);
+      if (response != null) response.close();
     }
   }
 
@@ -776,9 +773,82 @@ public class FusionPipelineClient {
           reader.close();
         } catch (Exception ignore) {}
       }
-      EntityUtils.consumeQuietly(getResp);
+      if (getResp instanceof HttpEntityAndResponse) {
+        ((HttpEntityAndResponse)getResp).close();
+      } else {
+        EntityUtils.consumeQuietly(getResp);
+      }
     }
     return qr;
+  }
+
+
+  public static class HttpEntityAndResponse implements HttpEntity, Closeable {
+
+    protected HttpEntity delegate;
+    protected CloseableHttpResponse httpResponse;
+
+    public HttpEntityAndResponse(HttpEntity delegate, CloseableHttpResponse httpResponse) {
+      this.delegate = delegate;
+      this.httpResponse = httpResponse;
+    }
+
+    public void close() {
+      if (delegate != null) {
+        EntityUtils.consumeQuietly(delegate);
+      }
+
+      if (httpResponse != null) {
+        try {
+          httpResponse.close();
+        } catch (Exception ignore){}
+      }
+    }
+
+    @Override
+    public boolean isRepeatable() {
+      return delegate.isRepeatable();
+    }
+
+    @Override
+    public boolean isChunked() {
+      return delegate.isChunked();
+    }
+
+    @Override
+    public long getContentLength() {
+      return delegate.getContentLength();
+    }
+
+    @Override
+    public Header getContentType() {
+      return delegate.getContentType();
+    }
+
+    @Override
+    public Header getContentEncoding() {
+      return delegate.getContentEncoding();
+    }
+
+    @Override
+    public InputStream getContent() throws IOException, UnsupportedOperationException {
+      return delegate.getContent();
+    }
+
+    @Override
+    public void writeTo(OutputStream outputStream) throws IOException {
+      delegate.writeTo(outputStream);
+    }
+
+    @Override
+    public boolean isStreaming() {
+      return delegate.isStreaming();
+    }
+
+    @Override
+    public void consumeContent() throws IOException {
+      delegate.consumeContent();
+    }
   }
 
   public HttpEntity sendRequestToFusion(HttpUriRequest httpRequest) throws Exception {
@@ -795,8 +865,8 @@ public class FusionPipelineClient {
     String hostAndPort = url.getProtocol()+"://"+url.getHost()+":"+url.getPort();
     FusionSession fusionSession = getSession(hostAndPort, requestId);
 
-    HttpEntity entity;
-    HttpResponse response;
+    HttpEntity entity = null;
+    CloseableHttpResponse response = null;
     HttpClientContext context = null;
 
     if (log.isDebugEnabled()) {
@@ -821,9 +891,15 @@ public class FusionPipelineClient {
 
     if (!retry) {
       if (statusCode == 200 || statusCode == 204) {
-        return entity;
+        // the requesting client needs to close the entity and HttpResponse object
+        return new HttpEntityAndResponse(entity, response);
       } else {
-        raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+        try {
+          raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+        } finally {
+          EntityUtils.consumeQuietly(entity);
+          if (response != null) response.close();
+        }
       }
     }
 
@@ -833,13 +909,8 @@ public class FusionPipelineClient {
               " to Fusion at " + endpoint + ", will re-try to establish session");
 
       // re-establish the session and re-try the request
-      try {
-        EntityUtils.consume(entity);
-      } catch (Exception ignore) {
-        log.warn("Failed to consume entity due to: " + ignore);
-      } finally {
-        entity = null;
-      }
+      EntityUtils.consumeQuietly(entity);
+      response.close();
 
       String sessionKey = fusionSession.id;
       synchronized (this) {
@@ -861,12 +932,23 @@ public class FusionPipelineClient {
       if (statusCode == 200 || statusCode == 204) {
         log.info("Re-try request " + requestId + " after session timeout succeeded for: " + endpoint);
       } else {
-        raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+        try {
+          raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+        } finally {
+          EntityUtils.consumeQuietly(entity);
+          if (response != null) response.close();
+        }
       }
     } else if (statusCode != 200 && statusCode != 204) {
-      raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+      try {
+        raiseFusionServerException(endpoint, entity, statusCode, response, requestId);
+      } finally {
+        EntityUtils.consumeQuietly(entity);
+        if (response != null) response.close();
+      }
     }
-    return entity;
+
+    return new HttpEntityAndResponse(entity, response);
   }
 
   protected void raiseFusionServerException(String endpoint, HttpEntity entity, int statusCode, HttpResponse response, int requestId) {
@@ -906,6 +988,7 @@ public class FusionPipelineClient {
     }
 
     if (httpClient != null) {
+      log.info("Closing HttpClient.");
       try {
         httpClient.close();
       } catch (IOException e) {
