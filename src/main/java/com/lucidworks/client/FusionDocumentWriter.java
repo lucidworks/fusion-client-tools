@@ -11,7 +11,6 @@ import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SolrInputDocument;
 import org.apache.solr.common.SolrInputField;
 
-import org.apache.solr.common.util.DateUtil;
 
 import java.io.IOException;
 import java.util.*;
@@ -502,7 +501,7 @@ public class FusionDocumentWriter implements SolrInputDocumentWriter {
     } catch (Exception ignore){}
 
     try {
-      solrProxy.shutdown();
+      solrProxy.close();
     } catch (Exception ignore){}
   }
 

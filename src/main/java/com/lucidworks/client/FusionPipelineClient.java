@@ -39,7 +39,6 @@ import org.apache.solr.client.solrj.impl.HttpClientUtil;
 import org.apache.solr.client.solrj.impl.HttpSolrClient;
 import org.apache.solr.client.solrj.impl.Krb5HttpClientConfigurer;
 import org.apache.solr.client.solrj.impl.XMLResponseParser;
-import org.apache.solr.client.solrj.request.QueryRequest;
 import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.util.NamedList;
@@ -753,6 +752,85 @@ public class FusionPipelineClient {
     } else {
       String hostAndPort = getLbServer(mutable);
       qr = sendQuery(hostAndPort, queryPath, requestId);
+    }
+    return qr;
+  }
+
+  public SearchResponse queryFusionJson(String queryPipelinePath, SolrQuery query) throws Exception {
+    query.set("wt", "json");
+
+    String queryPath = queryPipelinePath+"?"+query;
+
+    SearchResponse qr = null;
+    int requestId = requestCounter.incrementAndGet();
+    ArrayList<String> mutable = getAvailableServers();
+    if (mutable.size() > 1) {
+      Exception lastExc = null;
+
+      // try all the endpoints until success is reached ... or we run out of endpoints to try ...
+      while (!mutable.isEmpty()) {
+        String hostAndPort = getLbServer(mutable);
+        if (hostAndPort == null) {
+          // no more endpoints available ... fail
+          if (lastExc != null) {
+            log.error("No more hosts available to retry failed request (" + requestId + ")! raising last seen error: " + lastExc);
+            throw lastExc;
+          } else {
+            throw new RuntimeException("No Fusion hosts available to process request " + requestId + "! Check logs for previous errors.");
+          }
+        }
+
+        Exception retryAfterException = null;
+        try {
+          qr = sendQueryAndParserAsJson(hostAndPort, queryPath, requestId);
+          retryAfterException = null;
+        } catch (Exception exc) {
+          retryAfterException = exc;
+        }
+
+        if (retryAfterException == null) {
+          lastExc = null;
+          break; // request succeeded ...
+        }
+
+        lastExc = retryAfterException; // try next hostAndPort (if available) after seeing an exception
+      }
+
+      if (lastExc != null) {
+        // request failed and we exhausted the list of endpoints to try ...
+        log.error("Failing request " + requestId + " due to: " + lastExc);
+        throw lastExc;
+      }
+
+    } else {
+      String hostAndPort = getLbServer(mutable);
+      qr = sendQueryAndParserAsJson(hostAndPort, queryPath, requestId);
+    }
+    return qr;
+  }
+
+  protected SearchResponse sendQueryAndParserAsJson(String hostAndPort, String query, int requestId) throws Exception {
+    HttpGet getReq = new HttpGet(hostAndPort+query);
+    HttpEntity getResp = sendRequestToFusion(getReq, true, requestId);
+    JsonResponseParser responseParser = new JsonResponseParser(jsonObjectMapper);
+    InputStream inputStream = null;
+    SearchResponse qr = null;
+    try {
+//      reader = new BufferedReader(new InputStreamReader(getResp.getContent()));
+      inputStream = getResp.getContent();
+      qr = responseParser.processResponse(inputStream, "UTF-8");
+    } finally {
+
+      if (inputStream != null) {
+        try {
+          inputStream.close();
+        } catch (Exception ignore) {}
+      }
+      if (getResp instanceof HttpEntityAndResponse) {
+        ((HttpEntityAndResponse)getResp).close();
+      } else {
+        EntityUtils.consumeQuietly(getResp);
+      }
     }
     return qr;
   }
